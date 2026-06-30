@@ -29,7 +29,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport/api/types/accesslist"
-	"github.com/gravitational/teleport/lib/scopes"
 	scopedaccess "github.com/gravitational/teleport/lib/scopes/access"
 )
 
@@ -108,25 +107,25 @@ func TestAccessListHierarchyDepthCheck(t *testing.T) {
 	}
 
 	accessListAndMembersGetter := &mockAccessListAndMembersGetter{
-		members:     make(map[scopes.QualifiedName][]*accesslist.AccessListMember),
-		accessLists: make(map[scopes.QualifiedName]*accesslist.AccessList),
+		members:     make(map[NormalizedSQN][]*accesslist.AccessListMember),
+		accessLists: make(map[NormalizedSQN]*accesslist.AccessList),
 	}
 
 	// Create members up to MaxAllowedDepth
 	for i := range accesslist.MaxAllowedDepth {
 		member := newAccessListMember(t, acls[i].GetName(), acls[i+1].GetName(), accesslist.MembershipKindList, clock)
 		acls[i+1].Status.MemberOf = append(acls[i+1].Status.MemberOf, acls[i].GetName())
-		accessListAndMembersGetter.members[ScopeQualifiedName(acls[i])] = []*accesslist.AccessListMember{member}
-		accessListAndMembersGetter.accessLists[ScopeQualifiedName(acls[i])] = acls[i]
+		accessListAndMembersGetter.members[NormalizedSQN(ScopeQualifiedName(acls[i]))] = []*accesslist.AccessListMember{member}
+		accessListAndMembersGetter.accessLists[NormalizedSQN(ScopeQualifiedName(acls[i]))] = acls[i]
 	}
 	// Set remaining Access Lists' members to empty slices
 	for i := accesslist.MaxAllowedDepth; i < numAcls; i++ {
-		accessListAndMembersGetter.members[ScopeQualifiedName(acls[i])] = []*accesslist.AccessListMember{}
-		accessListAndMembersGetter.accessLists[ScopeQualifiedName(acls[i])] = acls[i]
+		accessListAndMembersGetter.members[NormalizedSQN(ScopeQualifiedName(acls[i]))] = []*accesslist.AccessListMember{}
+		accessListAndMembersGetter.accessLists[NormalizedSQN(ScopeQualifiedName(acls[i]))] = acls[i]
 	}
 
 	// Should be valid with existing member < MaxAllowedDepth
-	err := ValidateAccessListMember(ctx, acls[accesslist.MaxAllowedDepth-1], accessListAndMembersGetter.members[ScopeQualifiedName(acls[accesslist.MaxAllowedDepth-1])][0], accessListAndMembersGetter)
+	err := ValidateAccessListMember(ctx, acls[accesslist.MaxAllowedDepth-1], accessListAndMembersGetter.members[NormalizedSQN(ScopeQualifiedName(acls[accesslist.MaxAllowedDepth-1]))][0], accessListAndMembersGetter)
 	require.NoError(t, err)
 
 	// Now, attempt to add a member that increases the depth beyond MaxAllowedDepth
@@ -508,22 +507,22 @@ func TestAccessListValidateWithMembers_members(t *testing.T) {
 	}
 
 	accessListAndMembersGetter := &mockAccessListAndMembersGetter{
-		members: map[scopes.QualifiedName][]*accesslist.AccessListMember{
-			ScopeQualifiedName(rootAcl): {},
+		members: map[NormalizedSQN][]*accesslist.AccessListMember{
+			NormalizedSQN(ScopeQualifiedName(rootAcl)): {},
 		},
 		accessLists: mockAccessLists(rootAcl),
 	}
 	for i := range accesslist.MaxAllowedDepth + 1 {
 		if i < accesslist.MaxAllowedDepth {
-			accessListAndMembersGetter.members[ScopeQualifiedName(nestedAcls[i])] = []*accesslist.AccessListMember{members[i]}
+			accessListAndMembersGetter.members[NormalizedSQN(ScopeQualifiedName(nestedAcls[i]))] = []*accesslist.AccessListMember{members[i]}
 		}
-		accessListAndMembersGetter.accessLists[ScopeQualifiedName(nestedAcls[i])] = nestedAcls[i]
+		accessListAndMembersGetter.accessLists[NormalizedSQN(ScopeQualifiedName(nestedAcls[i]))] = nestedAcls[i]
 	}
 
 	// Should validate successfully, as acl-0 -> acl-10 is a valid hierarchy of depth 10.
 	err := ValidateAccessListWithMembers(ctx, nil, rootAcl, []*accesslist.AccessListMember{}, accessListAndMembersGetter)
 	require.NoError(t, err)
-	err = ValidateAccessListWithMembers(ctx, nil, nestedAcls[0], []*accesslist.AccessListMember{accessListAndMembersGetter.members[ScopeQualifiedName(nestedAcls[0])][0]}, accessListAndMembersGetter)
+	err = ValidateAccessListWithMembers(ctx, nil, nestedAcls[0], []*accesslist.AccessListMember{accessListAndMembersGetter.members[NormalizedSQN(ScopeQualifiedName(nestedAcls[0]))][0]}, accessListAndMembersGetter)
 	require.NoError(t, err)
 
 	// Calling `ValidateAccessListWithMembers`, with `rootAclm1`, should fail, as it would exceed the maximum nesting depth.
@@ -550,8 +549,8 @@ func TestAccessListValidateWithMembers_members(t *testing.T) {
 	}
 
 	accessListAndMembersGetter = &mockAccessListAndMembersGetter{
-		members:     map[scopes.QualifiedName][]*accesslist.AccessListMember{},
-		accessLists: map[scopes.QualifiedName]*accesslist.AccessList{},
+		members:     map[NormalizedSQN][]*accesslist.AccessListMember{},
+		accessLists: map[NormalizedSQN]*accesslist.AccessList{},
 	}
 
 	// Create the members for the first hierarchy.
@@ -599,8 +598,8 @@ func Test_ValidateAccessListWithMembers_audit(t *testing.T) {
 	var accessList *accesslist.AccessList
 
 	accessListAndMembersGetter := &mockAccessListAndMembersGetter{
-		members: map[scopes.QualifiedName][]*accesslist.AccessListMember{},
-		accessLists: map[scopes.QualifiedName]*accesslist.AccessList{
+		members: map[NormalizedSQN][]*accesslist.AccessListMember{},
+		accessLists: map[NormalizedSQN]*accesslist.AccessList{
 			{Name: accessListName}: accessList,
 		},
 	}
