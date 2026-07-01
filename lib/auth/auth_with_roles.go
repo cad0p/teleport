@@ -6426,8 +6426,13 @@ func (a *ServerWithRoles) GetApplicationServers(ctx context.Context, namespace s
 
 // UpsertApplicationServer registers an application server.
 func (a *ServerWithRoles) UpsertApplicationServer(ctx context.Context, server types.AppServer) (*types.KeepAlive, error) {
-	if err := a.actionNamespace(server.GetNamespace(), types.KindAppServer, types.VerbCreate, types.VerbUpdate); err != nil {
-		return nil, trace.Wrap(err)
+	if err := a.agentResourceAction(ctx, server.GetHostID(), types.RoleApp); err != nil {
+		if !errors.Is(err, ErrNoAgentIdentity) {
+			return nil, trace.Wrap(err)
+		}
+		if err := a.actionNamespace(server.GetNamespace(), types.KindAppServer, types.VerbCreate, types.VerbUpdate); err != nil {
+			return nil, trace.Wrap(err)
+		}
 	}
 	if server.GetScope() != "" {
 		return nil, trace.BadParameter("scoped app server must register a control stream")
@@ -6437,8 +6442,13 @@ func (a *ServerWithRoles) UpsertApplicationServer(ctx context.Context, server ty
 
 // DeleteApplicationServer deletes specified application server.
 func (a *ServerWithRoles) DeleteApplicationServer(ctx context.Context, namespace, hostID, name string) error {
-	if err := a.actionNamespace(namespace, types.KindAppServer, types.VerbDelete); err != nil {
-		return trace.Wrap(err)
+	if err := a.agentResourceAction(ctx, hostID, types.RoleApp); err != nil {
+		if !errors.Is(err, ErrNoAgentIdentity) {
+			return trace.Wrap(err)
+		}
+		if err := a.actionNamespace(namespace, types.KindAppServer, types.VerbDelete); err != nil {
+			return trace.Wrap(err)
+		}
 	}
 	return a.authServer.DeleteApplicationServer(ctx, namespace, hostID, name)
 }

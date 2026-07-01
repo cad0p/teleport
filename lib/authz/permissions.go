@@ -1200,7 +1200,7 @@ func unscopedDefinitionForBuiltinRole(clusterName string, recConfig readonly.Ses
 						types.NewRule(types.KindClusterNetworkingConfig, services.RO()),
 						types.NewRule(types.KindSessionRecordingConfig, services.RO()),
 						types.NewRule(types.KindClusterAuthPreference, services.RO()),
-						types.NewRule(types.KindAppServer, services.RW()),
+						types.NewRule(types.KindAppServer, services.RO()),
 						types.NewRule(types.KindApp, services.RO()),
 						types.NewRule(types.KindJWT, services.RW()),
 						types.NewRule(types.KindLock, services.RO()),

@@ -13721,13 +13721,6 @@ func TestRoleDatabaseLeastPrivilege(t *testing.T) {
 	// db is authenticated as the built-in RoleDatabase for ownID.
 	db := newScopedTestServerForHost(t, as, ownID, "" /* scope */, types.RoleDatabase)
 
-	// Seed both the database's own server and a foreign server directly in the
-	// backend (bypassing RBAC) so read/list subtests have something to filter.
-	_, err = as.AuthServer.UpsertDatabaseServer(ctx, makeDBServer(t, ownID))
-	require.NoError(t, err)
-	_, err = as.AuthServer.UpsertDatabaseServer(ctx, makeDBServer(t, otherID))
-	require.NoError(t, err)
-
 	t.Run("upsert own database service allowed", func(t *testing.T) {
 		_, err := db.UpsertDatabaseService(ctx, makeDBService(t, ownID))
 		require.NoError(t, err)
@@ -13783,6 +13776,85 @@ func TestRoleDatabaseLeastPrivilege(t *testing.T) {
 
 	t.Run("delete all database servers denied", func(t *testing.T) {
 		err := db.DeleteAllDatabaseServers(ctx, apidefaults.Namespace)
+		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
+	})
+}
+
+func TestRoleAppLeastPrivilege(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	as, err := authtest.NewAuthServer(authtest.AuthServerConfig{Dir: t.TempDir()})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, as.Close()) })
+
+	const ownID = "00000000-0000-0000-0000-000000000001"
+	const otherID = "00000000-0000-0000-0000-000000000002"
+
+	makeAppServer := func(t *testing.T, hostID string) types.AppServer {
+		server, err := types.NewAppServerV3(types.Metadata{
+			Name: "app",
+		}, types.AppServerSpecV3{
+			HostID:   hostID,
+			Hostname: "app.example.com",
+			App: &types.AppV3{
+				Metadata: types.Metadata{Name: "app"},
+				Spec:     types.AppSpecV3{URI: "http://localhost:8080"},
+			},
+		})
+		require.NoError(t, err)
+		return server
+	}
+
+	appKeepAlive := func(hostID string) types.KeepAlive {
+		return types.KeepAlive{
+			Type:      types.KeepAlive_APP,
+			Name:      "app",
+			Namespace: apidefaults.Namespace,
+			HostID:    hostID,
+			Expires:   time.Now().Add(5 * time.Minute),
+		}
+	}
+
+	// app is authenticated as the built-in RoleApp for ownID.
+	app := newScopedTestServerForHost(t, as, ownID, "" /* scope */, types.RoleApp)
+
+	t.Run("upsert own app server allowed", func(t *testing.T) {
+		_, err := app.UpsertApplicationServer(ctx, makeAppServer(t, ownID))
+		require.NoError(t, err)
+	})
+
+	t.Run("upsert other app server denied", func(t *testing.T) {
+		_, err := app.UpsertApplicationServer(ctx, makeAppServer(t, otherID))
+		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
+	})
+
+	t.Run("keepalive own app server allowed", func(t *testing.T) {
+		require.NoError(t, app.KeepAliveServer(ctx, appKeepAlive(ownID)))
+	})
+
+	t.Run("keepalive other app server denied", func(t *testing.T) {
+		err := app.KeepAliveServer(ctx, appKeepAlive(otherID))
+		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
+	})
+
+	// Seed the app's own server and a foreign server directly in the backend.
+	_, err = as.AuthServer.UpsertApplicationServer(ctx, makeAppServer(t, ownID))
+	require.NoError(t, err)
+	_, err = as.AuthServer.UpsertApplicationServer(ctx, makeAppServer(t, otherID))
+	require.NoError(t, err)
+
+	t.Run("delete own app server allowed", func(t *testing.T) {
+		require.NoError(t, app.DeleteApplicationServer(ctx, apidefaults.Namespace, ownID, "app"))
+	})
+
+	t.Run("delete other app server denied", func(t *testing.T) {
+		err := app.DeleteApplicationServer(ctx, apidefaults.Namespace, otherID, "app")
+		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
+	})
+
+	t.Run("delete all app servers denied", func(t *testing.T) {
+		err := app.DeleteAllApplicationServers(ctx, apidefaults.Namespace)
 		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
 	})
 }
