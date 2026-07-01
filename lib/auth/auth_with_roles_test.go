@@ -8979,7 +8979,7 @@ func TestGenerateHostCertsScoped(t *testing.T) {
 	require.Equal(t, scope, sshIdent.AgentScope)
 }
 
-func TestUpsertNode(t *testing.T) {
+func TestUpsertScopedNode(t *testing.T) {
 	t.Parallel()
 	as, err := authtest.NewAuthServer(authtest.AuthServerConfig{Dir: t.TempDir()})
 	require.NoError(t, err)
@@ -9012,12 +9012,6 @@ func TestUpsertNode(t *testing.T) {
 		nodeScope   string
 		shouldErr   bool
 	}{
-		{
-			name:        "unscoped - bypasses node ID check",
-			callerScope: "",
-			nodeName:    otherID,
-			nodeScope:   "",
-		},
 		{
 			name:        "scoped - matching ID and scope allowed",
 			callerScope: "/staging",
@@ -13598,4 +13592,66 @@ func TestScopePinnedEmitAuditEvent(t *testing.T) {
 	stream, err = scopedHostAuth.ResumeAuditStream(ctx, sessionID, "upload")
 	require.NoError(t, err)
 	require.NoError(t, stream.Close(ctx))
+}
+
+func TestRoleNodeLeastPrivilege(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	as, err := authtest.NewAuthServer(authtest.AuthServerConfig{Dir: t.TempDir()})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, as.Close()) })
+
+	const ownID = "00000000-0000-0000-0000-000000000001"
+	const otherID = "00000000-0000-0000-0000-000000000002"
+
+	makeNode := func(t *testing.T, name string) types.Server {
+		node, err := types.NewServer(name, types.KindNode, types.ServerSpecV2{
+			Addr:     "node.example.com:3022",
+			Hostname: "hostname",
+		})
+		require.NoError(t, err)
+		return node
+	}
+
+	nodeKeepAlive := func(name string) types.KeepAlive {
+		return types.KeepAlive{
+			Type:      types.KeepAlive_NODE,
+			Name:      name,
+			Namespace: apidefaults.Namespace,
+			Expires:   time.Now().Add(5 * time.Minute),
+		}
+	}
+
+	// node is authenticated as the built-in RoleNode for ownID.
+	node := newScopedTestServerForHost(t, as, ownID, "" /* scope */, types.RoleNode)
+
+	t.Run("upsert own node allowed", func(t *testing.T) {
+		_, err := node.UpsertNode(ctx, makeNode(t, ownID))
+		require.NoError(t, err)
+	})
+
+	t.Run("upsert other node denied", func(t *testing.T) {
+		_, err := node.UpsertNode(ctx, makeNode(t, otherID))
+		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
+	})
+
+	t.Run("keepalive own node allowed", func(t *testing.T) {
+		require.NoError(t, node.KeepAliveServer(ctx, nodeKeepAlive(ownID)))
+	})
+
+	t.Run("keepalive other node denied", func(t *testing.T) {
+		err := node.KeepAliveServer(ctx, nodeKeepAlive(otherID))
+		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
+	})
+
+	t.Run("delete node denied", func(t *testing.T) {
+		err := node.DeleteNode(ctx, apidefaults.Namespace, ownID)
+		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
+	})
+
+	t.Run("delete all nodes denied", func(t *testing.T) {
+		err := node.DeleteAllNodes(ctx, apidefaults.Namespace)
+		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
+	})
 }

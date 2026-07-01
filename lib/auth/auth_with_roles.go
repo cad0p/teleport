@@ -1146,20 +1146,18 @@ func (a *ServerWithRoles) ClearAlertAcks(ctx context.Context, req proto.ClearAle
 }
 
 func (a *ServerWithRoles) UpsertNode(ctx context.Context, s types.Server) (*types.KeepAlive, error) {
-	// Note: UpsertNode doesn't allow any namespaces but "default".
-	if err := a.authorizeAction(types.KindNode, types.VerbCreate, types.VerbUpdate); err != nil {
-		return nil, trace.Wrap(err)
+	if err := a.agentResourceAction(ctx, s.GetName(), types.RoleNode); err != nil {
+		if !errors.Is(err, ErrNoAgentIdentity) {
+			return nil, trace.Wrap(err)
+		}
+		if err := a.authorizeAction(types.KindNode, types.VerbCreate, types.VerbUpdate); err != nil {
+			return nil, trace.Wrap(err)
+		}
 	}
 
 	agentScope := a.context.Identity.GetIdentity().GetAgentScope()
-	if nodeScope := s.GetScope(); agentScope != "" {
-		if nodeScope != agentScope {
-			return nil, trace.AccessDenied("node scope %q does not match agent identity scope %q", nodeScope, agentScope)
-		}
-
-		if err := a.agentResourceAction(ctx, s.GetName(), types.RoleNode); err != nil && !errors.Is(err, ErrNoAgentIdentity) {
-			return nil, trace.Wrap(err)
-		}
+	if nodeScope := s.GetScope(); agentScope != "" && nodeScope != agentScope {
+		return nil, trace.AccessDenied("node scope %q does not match agent identity scope %q", nodeScope, agentScope)
 	}
 
 	return a.authServer.UpsertNode(ctx, s)
