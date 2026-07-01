@@ -6227,8 +6227,13 @@ func (a *ServerWithRoles) GetDatabaseServers(ctx context.Context, namespace stri
 
 // UpsertDatabaseServer creates or updates a new database proxy server.
 func (a *ServerWithRoles) UpsertDatabaseServer(ctx context.Context, server types.DatabaseServer) (*types.KeepAlive, error) {
-	if err := a.actionNamespace(server.GetNamespace(), types.KindDatabaseServer, types.VerbCreate, types.VerbUpdate); err != nil {
-		return nil, trace.Wrap(err)
+	if err := a.agentResourceAction(ctx, server.GetHostID(), types.RoleDatabase); err != nil {
+		if !errors.Is(err, ErrNoAgentIdentity) {
+			return nil, trace.Wrap(err)
+		}
+		if err := a.actionNamespace(server.GetNamespace(), types.KindDatabaseServer, types.VerbCreate, types.VerbUpdate); err != nil {
+			return nil, trace.Wrap(err)
+		}
 	}
 	if server.GetScope() != "" {
 		return nil, trace.BadParameter("scoped database server must register a control stream")
@@ -6238,8 +6243,13 @@ func (a *ServerWithRoles) UpsertDatabaseServer(ctx context.Context, server types
 
 // DeleteDatabaseServer removes the specified database proxy server.
 func (a *ServerWithRoles) DeleteDatabaseServer(ctx context.Context, namespace, hostID, name string) error {
-	if err := a.actionNamespace(namespace, types.KindDatabaseServer, types.VerbDelete); err != nil {
-		return trace.Wrap(err)
+	if err := a.agentResourceAction(ctx, hostID, types.RoleDatabase); err != nil {
+		if !errors.Is(err, ErrNoAgentIdentity) {
+			return trace.Wrap(err)
+		}
+		if err := a.actionNamespace(namespace, types.KindDatabaseServer, types.VerbDelete); err != nil {
+			return trace.Wrap(err)
+		}
 	}
 	return a.authServer.DeleteDatabaseServer(ctx, namespace, hostID, name)
 }
@@ -6254,8 +6264,13 @@ func (a *ServerWithRoles) DeleteAllDatabaseServers(ctx context.Context, namespac
 
 // UpsertDatabaseService creates or updates a new DatabaseService resource.
 func (a *ServerWithRoles) UpsertDatabaseService(ctx context.Context, service types.DatabaseService) (*types.KeepAlive, error) {
-	if err := a.actionNamespace(service.GetNamespace(), types.KindDatabaseService, types.VerbCreate, types.VerbUpdate); err != nil {
-		return nil, trace.Wrap(err)
+	if err := a.agentResourceAction(ctx, service.GetName(), types.RoleDatabase); err != nil {
+		if !errors.Is(err, ErrNoAgentIdentity) {
+			return nil, trace.Wrap(err)
+		}
+		if err := a.actionNamespace(service.GetNamespace(), types.KindDatabaseService, types.VerbCreate, types.VerbUpdate); err != nil {
+			return nil, trace.Wrap(err)
+		}
 	}
 	return a.authServer.UpsertDatabaseService(ctx, service)
 }
@@ -6270,8 +6285,13 @@ func (a *ServerWithRoles) DeleteAllDatabaseServices(ctx context.Context) error {
 
 // DeleteDatabaseService removes a specific DatabaseService resource.
 func (a *ServerWithRoles) DeleteDatabaseService(ctx context.Context, name string) error {
-	if err := a.authorizeAction(types.KindDatabaseService, types.VerbDelete); err != nil {
-		return trace.Wrap(err)
+	if err := a.agentResourceAction(ctx, name, types.RoleDatabase); err != nil {
+		if !errors.Is(err, ErrNoAgentIdentity) {
+			return trace.Wrap(err)
+		}
+		if err := a.authorizeAction(types.KindDatabaseService, types.VerbDelete); err != nil {
+			return trace.Wrap(err)
+		}
 	}
 	return a.authServer.DeleteDatabaseService(ctx, name)
 }

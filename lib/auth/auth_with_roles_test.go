@@ -13655,3 +13655,134 @@ func TestRoleNodeLeastPrivilege(t *testing.T) {
 		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
 	})
 }
+
+func TestRoleDatabaseLeastPrivilege(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	as, err := authtest.NewAuthServer(authtest.AuthServerConfig{Dir: t.TempDir()})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, as.Close()) })
+
+	const ownID = "00000000-0000-0000-0000-000000000001"
+	const otherID = "00000000-0000-0000-0000-000000000002"
+
+	makeDBServer := func(t *testing.T, hostID string) types.DatabaseServer {
+		server, err := types.NewDatabaseServerV3(types.Metadata{
+			Name: "db",
+		}, types.DatabaseServerSpecV3{
+			HostID:   hostID,
+			Hostname: "db.example.com",
+			Database: &types.DatabaseV3{
+				Metadata: types.Metadata{Name: "db"},
+				Spec: types.DatabaseSpecV3{
+					Protocol: "postgres",
+					URI:      "localhost:5432",
+				},
+			},
+		})
+		require.NoError(t, err)
+		return server
+	}
+
+	dbKeepAlive := func(hostID string) types.KeepAlive {
+		return types.KeepAlive{
+			Type:      types.KeepAlive_DATABASE,
+			Name:      "db",
+			Namespace: apidefaults.Namespace,
+			HostID:    hostID,
+			Expires:   time.Now().Add(5 * time.Minute),
+		}
+	}
+
+	// A DatabaseService is name-keyed: its name is the host ID of the db_service.
+	makeDBService := func(t *testing.T, hostID string) types.DatabaseService {
+		svc, err := types.NewDatabaseServiceV1(types.Metadata{
+			Name:      hostID,
+			Namespace: apidefaults.Namespace,
+		}, types.DatabaseServiceSpecV1{
+			ResourceMatchers: []*types.DatabaseResourceMatcher{
+				{Labels: &types.Labels{types.Wildcard: []string{types.Wildcard}}},
+			},
+		})
+		require.NoError(t, err)
+		return svc
+	}
+
+	dbServiceKeepAlive := func(hostID string) types.KeepAlive {
+		return types.KeepAlive{
+			Type:      types.KeepAlive_DATABASE_SERVICE,
+			Name:      hostID,
+			Namespace: apidefaults.Namespace,
+			Expires:   time.Now().Add(5 * time.Minute),
+		}
+	}
+
+	// db is authenticated as the built-in RoleDatabase for ownID.
+	db := newScopedTestServerForHost(t, as, ownID, "" /* scope */, types.RoleDatabase)
+
+	// Seed both the database's own server and a foreign server directly in the
+	// backend (bypassing RBAC) so read/list subtests have something to filter.
+	_, err = as.AuthServer.UpsertDatabaseServer(ctx, makeDBServer(t, ownID))
+	require.NoError(t, err)
+	_, err = as.AuthServer.UpsertDatabaseServer(ctx, makeDBServer(t, otherID))
+	require.NoError(t, err)
+
+	t.Run("upsert own database service allowed", func(t *testing.T) {
+		_, err := db.UpsertDatabaseService(ctx, makeDBService(t, ownID))
+		require.NoError(t, err)
+	})
+
+	t.Run("upsert other database service denied", func(t *testing.T) {
+		_, err := db.UpsertDatabaseService(ctx, makeDBService(t, otherID))
+		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
+	})
+
+	t.Run("keepalive own database service allowed", func(t *testing.T) {
+		require.NoError(t, db.KeepAliveServer(ctx, dbServiceKeepAlive(ownID)))
+	})
+
+	t.Run("keepalive other database service denied", func(t *testing.T) {
+		err := db.KeepAliveServer(ctx, dbServiceKeepAlive(otherID))
+		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
+	})
+
+	t.Run("upsert own database server allowed", func(t *testing.T) {
+		_, err := db.UpsertDatabaseServer(ctx, makeDBServer(t, ownID))
+		require.NoError(t, err)
+	})
+
+	t.Run("upsert other database server denied", func(t *testing.T) {
+		_, err := db.UpsertDatabaseServer(ctx, makeDBServer(t, otherID))
+		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
+	})
+
+	t.Run("keepalive own database server allowed", func(t *testing.T) {
+		require.NoError(t, db.KeepAliveServer(ctx, dbKeepAlive(ownID)))
+	})
+
+	t.Run("keepalive other database server denied", func(t *testing.T) {
+		err := db.KeepAliveServer(ctx, dbKeepAlive(otherID))
+		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
+	})
+
+	// Seed both the database's own server and a foreign server directly in the backend.
+	_, err = as.AuthServer.UpsertDatabaseServer(ctx, makeDBServer(t, ownID))
+	require.NoError(t, err)
+	_, err = as.AuthServer.UpsertDatabaseServer(ctx, makeDBServer(t, otherID))
+	require.NoError(t, err)
+
+	t.Run("delete own database server allowed", func(t *testing.T) {
+		require.NoError(t, db.DeleteDatabaseServer(ctx, apidefaults.Namespace, ownID, "db"))
+	})
+
+	t.Run("delete other database server denied", func(t *testing.T) {
+		err := db.DeleteDatabaseServer(ctx, apidefaults.Namespace, otherID, "db")
+		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
+	})
+
+	t.Run("delete all database servers denied", func(t *testing.T) {
+		err := db.DeleteAllDatabaseServers(ctx, apidefaults.Namespace)
+		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
+	})
+}
