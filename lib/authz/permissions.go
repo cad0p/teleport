@@ -1343,7 +1343,7 @@ func unscopedDefinitionForBuiltinRole(clusterName string, recConfig readonly.Ses
 					Namespaces:       []string{types.Wildcard},
 					KubernetesLabels: types.Labels{types.Wildcard: []string{types.Wildcard}},
 					Rules: []types.Rule{
-						types.NewRule(types.KindKubeServer, services.RW()),
+						types.NewRule(types.KindKubeServer, services.RO()),
 						types.NewRule(types.KindKubeWaitingContainer, services.RW()),
 						types.NewRule(types.KindEvent, services.WO()),
 						types.NewRule(types.KindCertAuthority, services.ReadNoSecrets()),

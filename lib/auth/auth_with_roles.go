@@ -6849,8 +6849,13 @@ func (a *ScopedServerWithRoles) GetKubernetesServers(ctx context.Context) ([]typ
 // UpsertKubernetesServer creates or updates a Server representing a teleport
 // kubernetes server.
 func (a *ServerWithRoles) UpsertKubernetesServer(ctx context.Context, s types.KubeServer) (*types.KeepAlive, error) {
-	if err := a.authorizeAction(types.KindKubeServer, types.VerbCreate, types.VerbUpdate); err != nil {
-		return nil, trace.Wrap(err)
+	if err := a.agentResourceAction(ctx, s.GetHostID(), types.RoleKube); err != nil {
+		if !errors.Is(err, ErrNoAgentIdentity) {
+			return nil, trace.Wrap(err)
+		}
+		if err := a.authorizeAction(types.KindKubeServer, types.VerbCreate, types.VerbUpdate); err != nil {
+			return nil, trace.Wrap(err)
+		}
 	}
 	if s.GetScope() != "" {
 		return nil, trace.BadParameter("scoped kubernetes server must register a control stream")
@@ -6860,8 +6865,13 @@ func (a *ServerWithRoles) UpsertKubernetesServer(ctx context.Context, s types.Ku
 
 // DeleteKubernetesServer deletes specified kubernetes server.
 func (a *ServerWithRoles) DeleteKubernetesServer(ctx context.Context, hostID, name string) error {
-	if err := a.authorizeAction(types.KindKubeServer, types.VerbDelete); err != nil {
-		return trace.Wrap(err)
+	if err := a.agentResourceAction(ctx, hostID, types.RoleKube); err != nil {
+		if !errors.Is(err, ErrNoAgentIdentity) {
+			return trace.Wrap(err)
+		}
+		if err := a.authorizeAction(types.KindKubeServer, types.VerbDelete); err != nil {
+			return trace.Wrap(err)
+		}
 	}
 	return a.authServer.DeleteKubernetesServer(ctx, hostID, name)
 }

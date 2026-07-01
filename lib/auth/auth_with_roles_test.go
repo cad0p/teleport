@@ -103,6 +103,7 @@ import (
 	"github.com/gravitational/teleport/lib/srv/discovery/common"
 	"github.com/gravitational/teleport/lib/sshca"
 	"github.com/gravitational/teleport/lib/tlsca"
+	"github.com/gravitational/teleport/lib/utils"
 )
 
 func TestGenerateUserCerts_MFAVerifiedFieldSet(t *testing.T) {
@@ -3531,7 +3532,7 @@ func TestKubeCRUDFromKubeService(t *testing.T) {
 	scopedKubeClient, err := srv.NewClient(scopedIdent)
 	require.NoError(t, err)
 
-	unscopedKubeClient, err := srv.NewClient(authtest.TestBuiltin(types.RoleKube))
+	unscopedKubeClient, err := srv.NewClient(authtest.TestServerID(types.RoleKube, "host-id"))
 	require.NoError(t, err)
 
 	// create an admin client to create resources and setup for test cases
@@ -3729,11 +3730,11 @@ func TestKubeCRUDFromKubeService(t *testing.T) {
 		_, err := adminClient.UpsertKubernetesServer(ctx, ks)
 		require.NoError(t, err)
 
-		// unscoped kube clients SHOULD be able to delete all kube servers
+		// kube clients SHOULD NOT be able to delete all kube servers
 		err = unscopedKubeClient.DeleteAllKubernetesServers(ctx)
-		require.NoError(t, err)
+		require.Error(t, err)
+		require.True(t, trace.IsAccessDenied(err), "expected access denied error")
 
-		// scoped kube clients SHOULD NOT be able to delete all kube servers
 		err = scopedKubeClient.DeleteAllKubernetesServers(ctx)
 		require.Error(t, err)
 		require.True(t, trace.IsAccessDenied(err), "expected access denied error")
@@ -12231,10 +12232,13 @@ func TestKubeKeepAliveServer(t *testing.T) {
 			require.NoError(t, err)
 
 			// Create a built-in role.
+			username := utils.HostFQDN(hostID, domainName)
 			authContext, err := authz.ContextForBuiltinRole(
 				authz.BuiltinRole{
-					Role:     test.builtInRole,
-					Username: fmt.Sprintf("%s.%s", hostID, domainName),
+					Role:        test.builtInRole,
+					Username:    username,
+					ClusterName: domainName,
+					Identity:    tlsca.Identity{Username: username},
 				},
 				types.DefaultSessionRecordingConfig(),
 			)
@@ -13855,6 +13859,84 @@ func TestRoleAppLeastPrivilege(t *testing.T) {
 
 	t.Run("delete all app servers denied", func(t *testing.T) {
 		err := app.DeleteAllApplicationServers(ctx, apidefaults.Namespace)
+		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
+	})
+}
+
+func TestRoleKubeLeastPrivilege(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	as, err := authtest.NewAuthServer(authtest.AuthServerConfig{Dir: t.TempDir()})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, as.Close()) })
+
+	const ownID = "00000000-0000-0000-0000-000000000001"
+	const otherID = "00000000-0000-0000-0000-000000000002"
+
+	makeKubeServer := func(t *testing.T, hostID string) types.KubeServer {
+		cluster, err := types.NewKubernetesClusterV3(types.Metadata{Name: "kube"}, types.KubernetesClusterSpecV3{})
+		require.NoError(t, err)
+		server, err := types.NewKubernetesServerV3(types.Metadata{
+			Name:      "kube",
+			Namespace: apidefaults.Namespace,
+		}, types.KubernetesServerSpecV3{
+			Cluster: cluster,
+			HostID:  hostID,
+		})
+		require.NoError(t, err)
+		return server
+	}
+
+	kubeKeepAlive := func(hostID string) types.KeepAlive {
+		return types.KeepAlive{
+			Type:      types.KeepAlive_KUBERNETES,
+			Name:      "kube",
+			Namespace: apidefaults.Namespace,
+			HostID:    hostID,
+			Expires:   time.Now().Add(5 * time.Minute),
+		}
+	}
+
+	// kube is authenticated as the built-in RoleKube for ownID.
+	kube := newScopedTestServerForHost(t, as, ownID, "" /* scope */, types.RoleKube)
+
+	t.Run("upsert own kube server allowed", func(t *testing.T) {
+		_, err := kube.UpsertKubernetesServer(ctx, makeKubeServer(t, ownID))
+		require.NoError(t, err)
+	})
+
+	t.Run("upsert other kube server denied", func(t *testing.T) {
+		_, err := kube.UpsertKubernetesServer(ctx, makeKubeServer(t, otherID))
+		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
+	})
+
+	t.Run("keepalive own kube server allowed", func(t *testing.T) {
+		require.NoError(t, kube.KeepAliveServer(ctx, kubeKeepAlive(ownID)))
+	})
+
+	t.Run("keepalive other kube server denied", func(t *testing.T) {
+		err := kube.KeepAliveServer(ctx, kubeKeepAlive(otherID))
+		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
+	})
+
+	// Seed the kube service's own server and a foreign server directly in the backend.
+	_, err = as.AuthServer.UpsertKubernetesServer(ctx, makeKubeServer(t, ownID))
+	require.NoError(t, err)
+	_, err = as.AuthServer.UpsertKubernetesServer(ctx, makeKubeServer(t, otherID))
+	require.NoError(t, err)
+
+	t.Run("delete own kube server allowed", func(t *testing.T) {
+		require.NoError(t, kube.DeleteKubernetesServer(ctx, ownID, "kube"))
+	})
+
+	t.Run("delete other kube server denied", func(t *testing.T) {
+		err := kube.DeleteKubernetesServer(ctx, otherID, "kube")
+		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
+	})
+
+	t.Run("delete all kube servers denied", func(t *testing.T) {
+		err := kube.DeleteAllKubernetesServers(ctx)
 		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
 	})
 }
