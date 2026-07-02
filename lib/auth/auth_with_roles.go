@@ -721,10 +721,6 @@ func (a *ServerWithRoles) GetDomainName(ctx context.Context) (string, error) {
 	return a.authServer.GetDomainName()
 }
 
-func (a *ScopedServerWithRoles) GetDomainName(ctx context.Context) (string, error) {
-	return a.authServer.GetDomainName()
-}
-
 // GetClusterCACert returns the PEM-encoded TLS certs for the local cluster
 // without signing keys. If the cluster has multiple TLS certs, they will all
 // be concatenated.
@@ -1143,14 +1139,7 @@ func (a *ScopedServerWithRoles) UpsertNode(ctx context.Context, s types.Server) 
 	}
 
 	if a.hasBuiltinRole(types.RoleNode) {
-		clusterName, err := a.GetDomainName(ctx)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-		callerID, err := ExtractHostID(a.scopedContext.DisplayName(), clusterName)
-		if err != nil {
-			return nil, trace.AccessDenied("access denied")
-		}
+		callerID, _ := getBuiltinServerID(a.scopedContext.Identity)
 		if s.GetName() != callerID {
 			return nil, trace.AccessDenied("node ID %q does not match agent identity ID %q", s.GetName(), callerID)
 		}
@@ -2841,11 +2830,8 @@ func (a *ServerWithRoles) DeleteAuthServer(name string) error {
 }
 
 // UpsertProxyServer registers proxy server presence.
-func (a *ScopedServerWithRoles) UpsertProxyServer(ctx context.Context, s types.Server) (types.Server, error) {
-	ruleCtx := a.scopedContext.RuleContext()
-	if err := a.scopedContext.CheckerContext.Decision(ctx, s.GetScope(), func(checker *services.ScopedAccessChecker) error {
-		return checker.CheckAccessToRules(&ruleCtx, types.KindProxy, types.VerbCreate, types.VerbUpdate)
-	}); err != nil {
+func (a *ServerWithRoles) UpsertProxyServer(ctx context.Context, s types.Server) (types.Server, error) {
+	if err := a.authorizeAction(types.KindProxy, types.VerbCreate, types.VerbUpdate); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return a.authServer.UpsertProxyServer(ctx, s)
