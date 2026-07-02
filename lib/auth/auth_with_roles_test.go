@@ -94,6 +94,7 @@ import (
 	"github.com/gravitational/teleport/lib/okta/oktatest"
 	"github.com/gravitational/teleport/lib/scopes"
 	scopedaccess "github.com/gravitational/teleport/lib/scopes/access"
+	scopedapp "github.com/gravitational/teleport/lib/scopes/app"
 	"github.com/gravitational/teleport/lib/scopes/joining"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/services/local"
@@ -5894,6 +5895,164 @@ func createKubeServer(t *testing.T, s *auth.Server, clusterNames []string, hostI
 
 		_, err = s.UpsertKubernetesServer(context.Background(), kubeServer)
 		require.NoError(t, err)
+	}
+}
+
+func TestListResources_ScopedApps(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	srv := newTestTLSServer(t, withScopesFeatures(scopes.Features{Enabled: true, AgentPinEnabled: true}))
+
+	const scope = "/test"
+	const childScope = "/test/child"
+	const otherScope = "/other"
+
+	// TODO (williamo/scopes) use existing helpers
+	createAppServer := func(t *testing.T, name, scope string, labels map[string]string) {
+		t.Helper()
+		app, err := types.NewAppV3(types.Metadata{
+			Name:   name,
+			Labels: labels,
+		}, types.AppSpecV3{URI: "http://localhost:8080"})
+		require.NoError(t, err)
+		if scope != "" {
+			app.Scope = scope
+			app.Spec.PublicAddr = scopedapp.ScopedAppPublicAddr(scope, name, "proxy.example.com")
+		}
+		server, err := types.NewAppServerV3FromApp(app, name+"-host", name+"-hostid")
+		require.NoError(t, err)
+		server.Scope = scope
+		_, err = srv.Auth().UpsertApplicationServer(ctx, server)
+		require.NoError(t, err)
+	}
+
+	// Apps in the user's scope with differing labels,
+	createAppServer(t, "prod-app", scope, map[string]string{"env": "prod"})
+	createAppServer(t, "dev-app", scope, map[string]string{"env": "dev"})
+	createAppServer(t, "dev-child-app", childScope, map[string]string{"env": "dev"})
+	createAppServer(t, "other-scope-app", otherScope, map[string]string{"env": "prod"})
+	createAppServer(t, "unscoped-app", "", map[string]string{"env": "prod"})
+
+	// TODO (williamo/scopes) use existing helpers
+	newScopedAppClient := func(t *testing.T, scope, name string, appBlock *scopedaccessv1.ScopedRoleApp) *authclient.Client {
+		t.Helper()
+		roleResp, err := srv.Auth().ScopedAccess().CreateScopedRole(ctx,
+			scopedaccessv1.CreateScopedRoleRequest_builder{
+				Role: scopedaccessv1.ScopedRole_builder{
+					Kind:    scopedaccess.KindScopedRole,
+					Version: types.V1,
+					Metadata: headerv1.Metadata_builder{
+						Name: name + "-role",
+					}.Build(),
+					Scope: scope,
+					Spec: scopedaccessv1.ScopedRoleSpec_builder{
+						AssignableScopes: []string{scope},
+						App:              appBlock,
+					}.Build(),
+				}.Build(),
+			}.Build())
+		require.NoError(t, err)
+
+		user, err := authtest.CreateUser(ctx, srv.Auth(), name)
+		require.NoError(t, err)
+
+		sra, err := srv.Auth().ScopedAccess().CreateScopedRoleAssignment(ctx,
+			scopedaccessv1.CreateScopedRoleAssignmentRequest_builder{
+				Assignment: scopedaccessv1.ScopedRoleAssignment_builder{
+					Kind:    scopedaccess.KindScopedRoleAssignment,
+					SubKind: scopedaccess.SubKindDynamic,
+					Version: types.V1,
+					Metadata: headerv1.Metadata_builder{
+						Name: uuid.NewString(),
+					}.Build(),
+					Scope: scope,
+					Spec: scopedaccessv1.ScopedRoleAssignmentSpec_builder{
+						User: user.GetName(),
+						Assignments: []*scopedaccessv1.Assignment{
+							scopedaccessv1.Assignment_builder{
+								Role:  roleResp.GetRole().GetMetadata().GetName(),
+								Scope: scope,
+							}.Build(),
+						},
+					}.Build(),
+				}.Build(),
+			}.Build())
+		require.NoError(t, err)
+		waitForSRACache(t, srv, sra)
+
+		client, err := srv.NewClient(authtest.TestScopedUser(user.GetName(), scope))
+		require.NoError(t, err)
+		return client
+	}
+
+	cases := []struct {
+		name             string
+		client           *authclient.Client
+		appNamesExpected []string
+	}{
+		{
+			name: "prod labels in scope " + scope,
+			client: newScopedAppClient(t, scope, "test-prod-label", scopedaccessv1.ScopedRoleApp_builder{
+				Labels: []*labelv1.Label{
+					labelv1.Label_builder{Name: "env", Values: []string{"prod"}}.Build(),
+				},
+			}.Build()),
+			appNamesExpected: []string{"prod-app"},
+		},
+		{
+			name: "dev label in " + scope,
+			client: newScopedAppClient(t, scope, "test-dev-label", scopedaccessv1.ScopedRoleApp_builder{
+				Labels: []*labelv1.Label{
+					labelv1.Label_builder{Name: "env", Values: []string{"dev"}}.Build(),
+				}}.Build()),
+			appNamesExpected: []string{"dev-app", "dev-child-app"},
+		},
+		{
+			name: "dev label expression in " + scope,
+			client: newScopedAppClient(t, scope, "test-dev-expression", scopedaccessv1.ScopedRoleApp_builder{
+				LabelExpression: `contains(labels["env"], "dev")`,
+			}.Build()),
+			appNamesExpected: []string{"dev-app", "dev-child-app"},
+		},
+		{
+			name: "label expression in " + scope,
+			client: newScopedAppClient(t, scope, "test-prod-expression", scopedaccessv1.ScopedRoleApp_builder{
+				LabelExpression: `contains(labels["env"], "prod")`,
+			}.Build()),
+			appNamesExpected: []string{"prod-app"},
+		},
+		{
+			name: "label expression in " + childScope,
+			client: newScopedAppClient(t, childScope, "test-child-prod-expr", scopedaccessv1.ScopedRoleApp_builder{
+				LabelExpression: `contains(labels["env"], "prod")`,
+			}.Build()),
+			appNamesExpected: []string{},
+		},
+		{
+			name: "label expression in " + otherScope,
+			client: newScopedAppClient(t, otherScope, "other-prod-expression", scopedaccessv1.ScopedRoleApp_builder{
+				LabelExpression: `contains(labels["env"], "prod")`,
+			}.Build()),
+			appNamesExpected: []string{"other-scope-app"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := tc.client.ListResources(ctx, proto.ListResourcesRequest{
+				ResourceType: types.KindAppServer,
+				Limit:        10,
+			})
+			require.NoError(t, err)
+
+			var names []string
+			for _, r := range res.Resources {
+				names = append(names, r.GetName())
+				require.NotEqual(t, "unscoped-app", r.GetName())
+			}
+
+			require.ElementsMatch(t, tc.appNamesExpected, names)
+		})
 	}
 }
 
