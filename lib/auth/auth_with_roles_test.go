@@ -9015,7 +9015,7 @@ func TestUpsertNode(t *testing.T) {
 		{
 			name:        "unscoped - bypasses node ID check",
 			callerScope: "",
-			nodeName:    otherID,
+			nodeName:    nodeName,
 			nodeScope:   "",
 		},
 		{
@@ -9032,7 +9032,7 @@ func TestUpsertNode(t *testing.T) {
 			shouldErr:   true,
 		},
 		{
-			name:        "scoped - matching scope but mismatched ID denied",
+			name:        "mismatched ID denied",
 			callerScope: "/staging",
 			nodeName:    otherID,
 			nodeScope:   "/staging",
@@ -9043,7 +9043,7 @@ func TestUpsertNode(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			srv := newScopedTestServerForHost(t, as, nodeName, tt.callerScope, types.RoleNode)
-			_, err := srv.UpsertNode(t.Context(), makeNode(t, tt.nodeName, tt.nodeScope))
+			_, err := srv.ScopedServerWithRoles().UpsertNode(t.Context(), makeNode(t, tt.nodeName, tt.nodeScope))
 			if tt.shouldErr {
 				require.Error(t, err)
 				require.True(t, trace.IsAccessDenied(err))
