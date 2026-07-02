@@ -13940,3 +13940,110 @@ func TestRoleKubeLeastPrivilege(t *testing.T) {
 		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
 	})
 }
+
+func TestRoleWindowsDesktopLeastPrivilege(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	as, err := authtest.NewAuthServer(authtest.AuthServerConfig{Dir: t.TempDir()})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, as.Close()) })
+
+	const ownID = "00000000-0000-0000-0000-000000000001"
+	const otherID = "00000000-0000-0000-0000-000000000002"
+
+	makeDesktopService := func(t *testing.T, hostID string) types.WindowsDesktopService {
+		svc, err := types.NewWindowsDesktopServiceV3(types.Metadata{
+			Name: hostID,
+		}, types.WindowsDesktopServiceSpecV3{
+			Addr:            "localhost:3028",
+			TeleportVersion: "1.0.0",
+		})
+		require.NoError(t, err)
+		return svc
+	}
+
+	desktopKeepAlive := func(hostID string) types.KeepAlive {
+		return types.KeepAlive{
+			Type:      types.KeepAlive_WINDOWS_DESKTOP,
+			Name:      hostID,
+			Namespace: apidefaults.Namespace,
+			Expires:   time.Now().Add(5 * time.Minute),
+		}
+	}
+
+	makeDesktop := func(t *testing.T, hostID string) types.WindowsDesktop {
+		d, err := types.NewWindowsDesktopV3("desktop", nil, types.WindowsDesktopSpecV3{
+			Addr:   "1.2.3.4",
+			HostID: hostID,
+		})
+		require.NoError(t, err)
+		return d
+	}
+
+	// desktop is authenticated as the built-in RoleWindowsDesktop for ownID.
+	desktop := newScopedTestServerForHost(t, as, ownID, "" /* scope */, types.RoleWindowsDesktop)
+
+	t.Run("upsert own desktop service allowed", func(t *testing.T) {
+		_, err := desktop.UpsertWindowsDesktopService(ctx, makeDesktopService(t, ownID))
+		require.NoError(t, err)
+	})
+
+	t.Run("upsert other desktop service denied", func(t *testing.T) {
+		_, err := desktop.UpsertWindowsDesktopService(ctx, makeDesktopService(t, otherID))
+		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
+	})
+
+	t.Run("keepalive own desktop service allowed", func(t *testing.T) {
+		require.NoError(t, desktop.KeepAliveServer(ctx, desktopKeepAlive(ownID)))
+	})
+
+	t.Run("keepalive other desktop service denied", func(t *testing.T) {
+		err := desktop.KeepAliveServer(ctx, desktopKeepAlive(otherID))
+		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
+	})
+
+	// Seed the desktop service and a foreign service directly in the backend.
+	_, err = as.AuthServer.UpsertWindowsDesktopService(ctx, makeDesktopService(t, ownID))
+	require.NoError(t, err)
+	_, err = as.AuthServer.UpsertWindowsDesktopService(ctx, makeDesktopService(t, otherID))
+	require.NoError(t, err)
+
+	t.Run("delete own desktop service allowed", func(t *testing.T) {
+		require.NoError(t, desktop.DeleteWindowsDesktopService(ctx, ownID))
+	})
+
+	t.Run("delete other desktop service denied", func(t *testing.T) {
+		err := desktop.DeleteWindowsDesktopService(ctx, otherID)
+		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
+	})
+
+	t.Run("delete all desktop services denied", func(t *testing.T) {
+		err := desktop.DeleteAllWindowsDesktopServices(ctx)
+		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
+	})
+
+	t.Run("upsert own desktop allowed", func(t *testing.T) {
+		require.NoError(t, desktop.UpsertWindowsDesktop(ctx, makeDesktop(t, ownID)))
+	})
+
+	t.Run("upsert other desktop denied", func(t *testing.T) {
+		err := desktop.UpsertWindowsDesktop(ctx, makeDesktop(t, otherID))
+		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
+	})
+
+	// Seed the desktop service's own desktop and a foreign desktop directly in the backend.
+	err = as.AuthServer.UpsertWindowsDesktop(ctx, makeDesktop(t, ownID))
+	require.NoError(t, err)
+	err = as.AuthServer.UpsertWindowsDesktop(ctx, makeDesktop(t, otherID))
+	require.NoError(t, err)
+
+	t.Run("delete own desktop allowed", func(t *testing.T) {
+		require.NoError(t, desktop.DeleteWindowsDesktop(ctx, ownID, "desktop"))
+	})
+
+	t.Run("delete other desktop denied", func(t *testing.T) {
+		err := desktop.DeleteWindowsDesktop(ctx, otherID, "desktop")
+		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
+	})
+}

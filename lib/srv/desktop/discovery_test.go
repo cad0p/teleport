@@ -247,7 +247,7 @@ func testDynamicWindowsDiscovery(t *testing.T, client *authclient.Client, auth *
 	s := &WindowsService{
 		cfg: WindowsServiceConfig{
 			Heartbeat: HeartbeatConfig{
-				HostUUID: "1234",
+				HostUUID: "test-host-id",
 			},
 			Logger:               slog.New(slog.DiscardHandler),
 			Clock:                clockwork.NewRealClock(),
@@ -350,7 +350,7 @@ func TestDynamicWindowsDiscoveryExpiry(t *testing.T) {
 		s := &WindowsService{
 			cfg: WindowsServiceConfig{
 				Heartbeat: HeartbeatConfig{
-					HostUUID: "1234",
+					HostUUID: "test-host-id",
 				},
 				Logger:      slog.New(slog.DiscardHandler),
 				Clock:       clockwork.NewRealClock(),
