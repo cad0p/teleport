@@ -81,7 +81,7 @@ type ConnectionsHandlerConfig struct {
 	Emitter events.Emitter
 
 	// Authorizer is used to authorize requests.
-	Authorizer authz.Authorizer
+	Authorizer authz.ScopedAuthorizer
 
 	// HostID is the id of the host where this application agent is running.
 	HostID string
@@ -553,7 +553,7 @@ func (c *ConnectionsHandler) serveAWSWebConsole(w http.ResponseWriter, r *http.R
 
 // authorizeContext will check if the context carries identity information and
 // runs authorization checks on it.
-func (c *ConnectionsHandler) authorizeContext(ctx context.Context) (*authz.Context, types.Application, error) {
+func (c *ConnectionsHandler) authorizeContext(ctx context.Context) (*authz.ScopedContext, types.Application, error) {
 	// Only allow local and remote identities to proxy to an application.
 	userType, err := authz.UserFromContext(ctx)
 	if err != nil {
@@ -566,8 +566,7 @@ func (c *ConnectionsHandler) authorizeContext(ctx context.Context) (*authz.Conte
 		return nil, nil, trace.BadParameter("invalid identity: %T", userType)
 	}
 
-	// Extract authorizing context and identity of the user from the request.
-	authContext, err := c.cfg.Authorizer.Authorize(ctx)
+	authContext, err := c.cfg.Authorizer.AuthorizeScoped(ctx)
 	if err != nil {
 		return nil, nil, trace.Wrap(err)
 	}
@@ -579,10 +578,6 @@ func (c *ConnectionsHandler) authorizeContext(ctx context.Context) (*authz.Conte
 		identity.RouteToApp.Name,
 		identity.RouteToApp.PublicAddr,
 	)
-	if err != nil {
-		return nil, nil, trace.Wrap(err)
-	}
-	authPref, err := c.cfg.AccessPoint.GetAuthPreference(ctx)
 	if err != nil {
 		return nil, nil, trace.Wrap(err)
 	}
@@ -612,11 +607,14 @@ func (c *ConnectionsHandler) authorizeContext(ctx context.Context) (*authz.Conte
 		})
 	}
 
-	state := authContext.GetAccessState(authPref)
-	switch err := authContext.Checker.CheckAccess(
-		app,
-		state,
-		matchers...); {
+	state, err := authContext.CheckerContext.AccessStateFromTLSIdentity(ctx, &identity, c.cfg.AccessPoint)
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+
+	switch err := authContext.CheckerContext.Decision(ctx, app.GetScope(), func(check *services.ScopedAccessChecker) error {
+		return check.App().CheckAccessToApp(app, state, matchers...)
+	}); {
 	case errors.Is(err, services.ErrTrustedDeviceRequired) || errors.Is(err, services.ErrSessionMFARequired):
 		// When access is denied due to trusted device or session MFA requirements, these specific errors
 		// are returned directly to provide clarity to the client about the additional authentication steps needed.
@@ -692,9 +690,10 @@ func (c *ConnectionsHandler) handleConnection(ctx context.Context, cancel contex
 		default:
 			c.setConnAuth(tlsConn, err)
 		}
-	} else {
-		// Monitor the connection an update the context.
-		ctx, _, err = c.cfg.ConnectionMonitor.MonitorConn(ctx, authCtx, tc)
+	} else if unscopedAuthCtx, ok := authCtx.UnscopedContext(); ok {
+		// TODO (williamo/scopes) - pass in the scoped context when scoped role app block have options
+		// added (idle timeout, disconnect_expired_cert, locking mode, etc)
+		ctx, _, err = c.cfg.ConnectionMonitor.MonitorConn(ctx, unscopedAuthCtx, tc)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -715,9 +714,14 @@ func (c *ConnectionsHandler) handleConnection(ctx context.Context, cancel contex
 		return nil, trace.Wrap(c.handleTCPApp(ctx, tlsConn, &identity, app))
 
 	case app.IsMCP():
+		// TODO (williamo/scopes): change this to a scoped context when we support MCP.
+		unscopedAuthCtx, ok := authCtx.UnscopedContext()
+		if !ok {
+			return nil, trace.BadParameter("MCP application access is not supported for scoped identities")
+		}
 		sessionCtx := mcp.SessionCtx{
 			ClientConn: tlsConn,
-			AuthCtx:    authCtx,
+			AuthCtx:    unscopedAuthCtx,
 			App:        app,
 		}
 		return nil, trace.Wrap(c.mcpServer.HandleSession(ctx, &sessionCtx))
