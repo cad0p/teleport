@@ -92,7 +92,7 @@ see [QUERY.md](references/QUERY.md).
   **temporary** access (granted by an access request; self-expiring).
 - **Results are scoped to your query.** A query through an access list shows only
   paths that flow through that list — not every path each member has. To see a
-  user's *complete* access to a resource, scope by the user and resource
+  user's _complete_ access to a resource, scope by the user and resource
   directly. Activity, by contrast, is **path-agnostic** — a returned pair's
   `activity` count is total usage — so a list-scoped `0`/`never` is a real
   "unused". But **"unused" is not "safe to de-list"**: the same resource is often
@@ -105,7 +105,7 @@ see [QUERY.md](references/QUERY.md).
 
 Follow the [agentic experience guide](references/EXPERIENCE.md) for the intended
 workflows: access-list recertification (and its scoping follow-up), "who can
-access this resource", "who has *used* this access" (and the difference from
+access this resource", "who has _used_ this access" (and the difference from
 `tctl investigate`), and unused-access cleanup. It also covers edge cases
 (truncation, empty results, `iac_error`, name resolution) and interaction
 patterns.
@@ -114,11 +114,11 @@ patterns.
 
 Run `$TCTL access-review --help` for the full list. Summary:
 
-| Flag         | Purpose                                                                                  |
-| ------------ | ---------------------------------------------------------------------------------------- |
-| `--query`    | **Required.** `SELECT … FROM access_path` scoping the identities to review.              |
-| `--from`     | Show activity at/after this time; **enables** the activity columns. RFC3339, `YYYY-MM-DD`, `24h`, `7d`, `now`. |
-| `--to`       | Upper bound for activity. Requires `--from`; defaults to now.                            |
-| `--limit`    | Max identities to return (default 50). Raise it if you see the truncation warning.       |
+| Flag         | Purpose                                                                                                                            |
+| ------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `--query`    | **Required.** `SELECT … FROM access_path` scoping the identities to review.                                                        |
+| `--from`     | Show activity at/after this time; **enables** the activity columns. RFC3339, `YYYY-MM-DD`, `24h`, `7d`, `now`.                     |
+| `--to`       | Upper bound for activity. Requires `--from`; defaults to now.                                                                      |
+| `--limit`    | Max identities to return (default 50). Raise it if you see the truncation warning.                                                 |
 | `--detailed` | Text only: show each grantor with its own access level instead of the summary counts (a sole grantor folds onto the resource row). |
-| `--format`   | `text` (default), `json`, or `yaml`.                                                     |
+| `--format`   | `text` (default), `json`, or `yaml`.                                                                                               |

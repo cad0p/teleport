@@ -13,11 +13,11 @@ graph.
 
 ## Mental model: standing topology, not a timeline
 
-`access-review` answers **who *can* reach what, right now, and how** — the
-standing-privilege graph. It is *not* a session timeline. When activity is
-requested it annotates each *current* access path with how often it was used,
+`access-review` answers **who _can_ reach what, right now, and how** — the
+standing-privilege graph. It is _not_ a session timeline. When activity is
+requested it annotates each _current_ access path with how often it was used,
 but it only ever reports pairs that **have a path today**. Keep this distinct
-from `tctl investigate`, which is the temporal "who *did* what, when" log. The
+from `tctl investigate`, which is the temporal "who _did_ what, when" log. The
 two are complementary — see _Combining with `tctl investigate`_.
 
 ## Happy paths
@@ -54,7 +54,7 @@ $TCTL access-review --from 90d \
 
 The summary shows the primary grantor. When a pair is granted by several
 grantors and you need to see each one and its level (e.g. standing via a role
-*and* request via a break-glass list), switch to `--detailed`.
+_and_ request via a break-glass list), switch to `--detailed`.
 
 ### 4. Project with jq while iterating
 
@@ -80,9 +80,9 @@ $TCTL access-review --from 90d \
   --query "SELECT * FROM access_path WHERE identity_group IN ('Prod Admins')" --format json
 ```
 
-Each row is a member's access *granted through this list*, with the access count
+Each row is a member's access _granted through this list_, with the access count
 and last-access. **Activity is path-agnostic:** the count is that member's
-*total* usage of the resource over the window — not usage *via this list* — and a
+_total_ usage of the resource over the window — not usage _via this list_ — and a
 pair is returned only when at least one path exists. So a `0` / `never` here is a
 trustworthy "this member has not used this resource" (subject to the
 activity-source caveats below), no matter how many paths grant it.
@@ -90,20 +90,22 @@ activity-source caveats below), no matter how many paths grant it.
 **The trap is access, not activity — the list view is not the member's full
 picture, in two ways that matter for recertification.** (1) **It omits resources
 the member reaches only by other paths:** the `WHERE identity_group` filter
-returns only `(member, resource)` pairs with a path *through this list*, so a
+returns only `(member, resource)` pairs with a path _through this list_, so a
 resource the member reaches solely via another role or list never appears here.
 (2) **"Unused" does not mean "safe to de-list":** a resource shown here may also
-be granted by other paths, so removing the member from the list drops only *this*
+be granted by other paths, so removing the member from the list drops only _this_
 grant — if the `access` role (or another list) also grants it, their access
 persists. `grantor_counts` is the quick tell: more than one grant at the resolved
 level means a single de-listing won't revoke — confirm which grantors with
 `--detailed` or the cross-path follow-up below.
 
 **Gate — before recommending you trim the list, run the cross-path follow-up.**
-Use the list query to define the identities and resources, then re-query by
-identity and resource directly (optionally `--detailed`) to see *every* path and
-grantor — both the resources the list view omitted and the other grantors of the
-ones it showed:
+It answers two different questions, each with its own query.
+
+_Will de-listing actually revoke?_ Re-query the list's members against the
+resources the list reached, dropping the `identity_group` scope so **every**
+grantor of those pairs shows — not just the paths through this list (optionally
+`--detailed`):
 
 ```sh
 # identities = the list's members; resources = what the list reaches (from step 1)
@@ -113,16 +115,27 @@ $TCTL access-review --from 90d \
 ```
 
 The activity counts won't change — they're path-agnostic — but the grantors
-will. If Prod Admins is the *only* grantor of a resource, de-listing genuinely
+will. If Prod Admins is the _only_ grantor of a resource, de-listing genuinely
 revokes that access; if the `access` role also grants it, de-listing changes
 nothing. That's the difference between "trim the list" and "revoke the access".
-The direct query may also surface resources the member reaches by other paths
-that never appeared in the list view at all. Only access that is unused **and**
-granted solely by this list is a clean de-listing candidate.
+
+_What is the member's complete access?_ The query above is scoped by `resource
+IN (...)` to what the list already showed, so it **cannot** surface a resource a
+member reaches solely through another role or list. To see those, drop the
+`resource` filter and scope by identity alone:
+
+```sh
+$TCTL access-review --from 90d \
+  --query "SELECT * FROM access_path
+           WHERE identity IN ('alice@example.com','bob@example.com')"
+```
+
+Only access that is unused **and** granted solely by this list is a clean
+de-listing candidate.
 
 ### "Who can access prod-db?"
 
-Scope by the resource; no window needed if you only care about *who* and *how*:
+Scope by the resource; no window needed if you only care about _who_ and _how_:
 
 ```sh
 $TCTL access-review --query "SELECT * FROM access_path WHERE resource ILIKE 'prod-db%'" --format json \
@@ -131,7 +144,7 @@ $TCTL access-review --query "SELECT * FROM access_path WHERE resource ILIKE 'pro
 ```
 
 Report identities, their level, and the grantor. Remember empty rows: an
-identity listed with no resource is *in scope but without a qualifying path* (a
+identity listed with no resource is _in scope but without a qualifying path_ (a
 missing requirement or only non-access edges) — not an accessor. Note `denied`
 rows explicitly: a deny means they are blocked, not allowed.
 
@@ -146,29 +159,31 @@ $TCTL access-review --from 90d --query "SELECT * FROM access_path WHERE resource
 ```
 
 **`access-review` only counts usage on access paths that still exist.** If
-someone accessed prod-db and their access was *since removed*, the pair has no
+someone accessed prod-db and their access was _since removed_, the pair has no
 path today, so it won't appear here at all — the count isn't zero, the row is
 absent. For a definitive "who ever accessed this resource", including identities
 whose access was later revoked, use `tctl investigate` against the audit log
-(see below). Use `access-review` activity to answer "of those who *can* access
-it, who is *using* it".
+(see below). Use `access-review` activity to answer "of those who _can_ access
+it, who is _using_ it".
 
 ### "Does Alice still need all her standing access?" (unused / least-privilege)
 
 The unused-access cleanup flow (a real, recurring ask — e.g. "tell me if Ben has
 any unused permissions"). Scope to the one identity, add the policy window, and
-split used from unused. Avoid hedging: enumerate what *is* known.
+split used from unused. Avoid hedging: enumerate what _is_ known.
 
 ```sh
-$TCTL access-review --from 90d --query "SELECT * FROM access_path WHERE identity = 'alice@example.com'" \
-  --format json > /tmp/alice.json
+# Save the pull to a private scratch file
+f=$(mktemp) && $TCTL access-review --from 90d \
+  --query "SELECT * FROM access_path WHERE identity = 'alice@example.com'" --format json > "$f"
 # Standing access never used in the window — candidates to revoke, with the grantor to act on:
 jq -r '.identities[].resources[]
        | select(.level=="standing" and (.activity.count // 0)==0 and (.temporary|not))
-       | [(.resource.alias // .resource.name), .resource.sub_kind, (.grantors[0].node | .alias // .name // "?")] | @tsv' /tmp/alice.json
+       | [(.resource.alias // .resource.name), .resource.sub_kind, (.grantors[0].node | .alias // .name // "?")] | @tsv' "$f"
 # Used standing access — keep:
 jq -r '.identities[].resources[] | select(.level=="standing" and (.activity.count // 0)>0)
-       | [(.resource.alias // .resource.name), .activity.count, .activity.last_access] | @tsv' /tmp/alice.json
+       | [(.resource.alias // .resource.name), .activity.count, .activity.last_access] | @tsv' "$f"
+# rm "$f" when done.
 ```
 
 Present it as a concrete table: resource, kind, grantor, used/last-used — so the
@@ -191,29 +206,29 @@ to fix the role spec, then re-review to confirm the path is gone.
 
 The two skills answer different halves of an access question:
 
-| Question                                                   | Command                                  |
-| ---------------------------------------------------------- | ---------------------------------------- |
-| Who *can* reach X, how, and is that standing access used?  | `tctl access-review`                     |
-| Who *did* reach X, when, and what did they do there?       | `tctl investigate`                       |
+| Question                                                   | Command                                   |
+| ---------------------------------------------------------- | ----------------------------------------- |
+| Who _can_ reach X, how, and is that standing access used?  | `tctl access-review`                      |
+| Who _did_ reach X, when, and what did they do there?       | `tctl investigate`                        |
 | Who accessed X even though their access was since removed? | `tctl investigate` (audit log is durable) |
-| What are this user's standing privileges to clean up?      | `tctl access-review`                     |
+| What are this user's standing privileges to clean up?      | `tctl access-review`                      |
 
 A natural pairing: `access-review` to find dormant standing access, then
 `investigate` to confirm the identity truly did nothing relevant in the window
-before recommending revocation; or `investigate` to find who *touched* a
-resource, then `access-review` to show *how* each of them is granted it.
+before recommending revocation; or `investigate` to find who _touched_ a
+resource, then `access-review` to show _how_ each of them is granted it.
 
 ## Edge cases and fallbacks
 
 - **Separate "unused" from "safe to revoke," and trust activity only as far as
   its source.** Activity is path-agnostic, so a `0` / `never` on a returned pair
-  is a real "not used" — *provided the activity source is sound*. If *every*
+  is a real "not used" — _provided the activity source is sound_. If _every_
   identity in scope shows `0` / `never`, suspect the activity lookup (`iac_error`)
   or synthetic/test data before calling anything dormant, and say so rather than
   asserting "unused" as fact. Separately, "unused" never by itself means "safe to
   remove": confirm via the cross-path follow-up that no other grant keeps the
   access alive before recommending a revocation. Honest scoping, not hedging —
-  still enumerate everything you *can* assert.
+  still enumerate everything you _can_ assert.
 - **Empty rows are signal, not noise.** An identity with no resource row is in
   scope but has no qualifying path here — missing requirement, inactive
   membership, or only non-access edges. Don't drop these silently if the user

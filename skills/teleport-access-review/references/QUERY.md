@@ -31,32 +31,32 @@ client-side sort/search the JSON if you need an order.
 The left column is what you type; each matches a node of a particular kind.
 Unknown column names are rejected with a `400`: `column "<name>" not found`.
 
-| Column                | Node matched     | Matches on                                                        | Notes                                                                 |
-| --------------------- | ---------------- | ----------------------------------------------------------------- | --------------------------------------------------------------------- |
-| `identity`            | identity         | name **or** alias                                                 | Users, bots. Prefer `identity`; the legacy alias `user` is a SQL keyword and must be quoted as `"user"` (bare `user` is a `400`). |
-| `resource`            | resource         | name **or** alias                                                 | Servers, databases, apps, k8s, AWS resources, …                       |
-| `sub_resource`        | sub_resource     | name **or** alias                                                 | A resource's sub-resource (e.g. a database name within a DB server).  |
-| `identity_group`      | identity_group   | name **or** alias                                                 | Access lists, roles, access requests. Array-valued. Legacy: `user_group`. |
-| `resource_group`      | resource_group   | name **or** alias                                                 | Array-valued.                                                         |
-| `id`                  | any node         | the node's UUID                                                   | Exact match on the `id` shown in output. Useful for an unambiguous handle. |
-| `source`              | identity         | the identity's source (e.g. `TELEPORT`, `OKTA`)                   | Case-insensitive. Scope to one identity provider.                     |
-| `action` / `action_type` / `kind` | action | action name / sub-kind / action `type`                           | For advanced action-based scoping.                                    |
-| `resource_labels`     | resource         | the resource's labels (JSON)                                      | Use JSON operators (below).                                           |
-| `standing_privileges` | identity         | the identity's standing-privilege count (number)                  | **Filter-only**: the value is not returned in output and is sparsely populated; verify against a broad query before relying on a threshold. |
+| Column                            | Node matched   | Matches on                                       | Notes                                                                                                                                       |
+| --------------------------------- | -------------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `identity`                        | identity       | name **or** alias                                | Users, bots. Prefer `identity`; the legacy alias `user` is a SQL keyword and must be quoted as `"user"` (bare `user` is a `400`).           |
+| `resource`                        | resource       | name **or** alias                                | Servers, databases, apps, k8s, AWS resources, …                                                                                             |
+| `sub_resource`                    | sub_resource   | name **or** alias                                | A resource's sub-resource (e.g. a database name within a DB server).                                                                        |
+| `identity_group`                  | identity_group | name **or** alias                                | Access lists, roles, access requests. Array-valued. Legacy: `user_group`.                                                                   |
+| `resource_group`                  | resource_group | name **or** alias                                | Array-valued.                                                                                                                               |
+| `id`                              | any node       | the node's UUID                                  | Exact match on the `id` shown in output. Useful for an unambiguous handle.                                                                  |
+| `source`                          | identity       | the identity's source (e.g. `TELEPORT`, `OKTA`)  | Case-insensitive. Scope to one identity provider.                                                                                           |
+| `action` / `action_type` / `kind` | action         | action name / sub-kind / action `type`           | For advanced action-based scoping.                                                                                                          |
+| `resource_labels`                 | resource       | the resource's labels (JSON)                     | Use JSON operators (below).                                                                                                                 |
+| `standing_privileges`             | identity       | the identity's standing-privilege count (number) | **Filter-only**: the value is not returned in output and is sparsely populated; verify against a broad query before relying on a threshold. |
 
 ## Operators
 
 Allow-listed operators (anything else is a `400`
 `unsupported operator in the WHERE clause`):
 
-| Operator                              | Use                                                                 |
-| ------------------------------------- | ------------------------------------------------------------------- |
-| `=`, `!=`                             | Exact match / negation on a single value.                           |
-| `<`, `>`, `<=`, `>=`                  | Numeric comparison (e.g. `standing_privileges > 50`).               |
-| `IN (…)`, `NOT IN (…)`                | Match any of a list — the workhorse for reviewing a set of identities or resources. |
-| `LIKE` / `ILIKE` (and `NOT …`)        | Wildcard match with `%` / `_`. `ILIKE` is case-insensitive.         |
-| JSON: `?`, `?&`, `?\|`, `@>`, `<@`    | Existence / containment against `resource_labels`.                  |
-| `AND`, `OR`                           | Combine predicates.                                                 |
+| Operator                           | Use                                                                                 |
+| ---------------------------------- | ----------------------------------------------------------------------------------- |
+| `=`, `!=`                          | Exact match / negation on a single value.                                           |
+| `<`, `>`, `<=`, `>=`               | Numeric comparison (e.g. `standing_privileges > 50`).                               |
+| `IN (…)`, `NOT IN (…)`             | Match any of a list — the workhorse for reviewing a set of identities or resources. |
+| `LIKE` / `ILIKE` (and `NOT …`)     | Wildcard match with `%` / `_`. `ILIKE` is case-insensitive.                         |
+| JSON: `?`, `?&`, `?\|`, `@>`, `<@` | Existence / containment against `resource_labels`.                                  |
+| `AND`, `OR`                        | Combine predicates.                                                                 |
 
 **There is no regex operator** (`~`, `~*`, `SIMILAR TO` are not allowed). Use
 `ILIKE` for fuzzy matching.
@@ -88,20 +88,20 @@ silently returns nothing.)
 ## Query is the scope — and why that matters
 
 Results are derived **only from the graph your query produced**, so a single
-query can show you a *subset* of reality — paths are scoped to your query. This
+query can show you a _subset_ of reality — paths are scoped to your query. This
 is the single most important semantic to get right:
 
 > A query scoped through an **access list** exercises only the paths that flow
-> *through that list*. It does **not** show every path each member has to every
+> _through that list_. It does **not** show every path each member has to every
 > resource.
 
 So `SELECT * FROM access_path WHERE identity_group IN ('Prod Admins')` answers
-"what does membership in *Prod Admins* grant, and to whom" — not "what is the
+"what does membership in _Prod Admins_ grant, and to whom" — not "what is the
 full access of every Prod Admins member." A member may also reach a resource
 through another role, another list, or an access request, and those paths are
 invisible to that query.
 
-**Follow-up pattern.** To see a user's (or set of users') *complete* access to a
+**Follow-up pattern.** To see a user's (or set of users') _complete_ access to a
 resource regardless of how it is granted, scope by the identity and resource
 directly. Use the access-list query to define both sets, then re-query:
 
@@ -115,7 +115,7 @@ SELECT * FROM access_path
 WHERE resource IN (<resources from step 1>) AND identity IN (<identities from step 1>)
 ```
 
-To isolate *why* one row is granted, narrow `identity_group` to just the grantor
+To isolate _why_ one row is granted, narrow `identity_group` to just the grantor
 returned for that row:
 
 ```sql

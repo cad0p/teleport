@@ -4,28 +4,28 @@ The output is **identity-centric**: a list of identities, each with the
 resources it can reach and how. `--format json` (or `yaml`) returns a single
 object:
 
-| Field        | Type             | Description                                                                 |
-| ------------ | ---------------- | --------------------------------------------------------------------------- |
+| Field        | Type             | Description                                                                     |
+| ------------ | ---------------- | ------------------------------------------------------------------------------- |
 | `identities` | IdentityAccess[] | One entry per identity in the query's scope. Empty (`[]`) when nothing matched. |
-| `warnings`   | string[]         | Non-fatal notices (truncation, activity-lookup failure). Omitted when none. |
+| `warnings`   | string[]         | Non-fatal notices (truncation, activity-lookup failure). Omitted when none.     |
 
 ## IdentityAccess
 
-| Field       | Type             | Description                                                                                   |
-| ----------- | ---------------- | --------------------------------------------------------------------------------------------- |
-| `identity`  | Node             | The identity (user or bot).                                                                   |
-| `resources` | ResourceAccess[] | What it can reach **within the query's scope**. **May be empty** — see _Empty rows_ below.    |
+| Field       | Type             | Description                                                                                |
+| ----------- | ---------------- | ------------------------------------------------------------------------------------------ |
+| `identity`  | Node             | The identity (user or bot).                                                                |
+| `resources` | ResourceAccess[] | What it can reach **within the query's scope**. **May be empty** — see _Empty rows_ below. |
 
 ## ResourceAccess
 
-| Field       | Type      | Description                                                                                           |
-| ----------- | --------- | ---------------------------------------------------------------------------------------------------- |
-| `resource`  | Node      | The resource reached.                                                                                 |
-| `level`     | string    | Resolved access level: `standing`, `impersonate`, `request`, or `denied` (see _Levels_).             |
-| `temporary` | bool      | `true` when the access is self-expiring (granted by an access request). Rendered as a `*` in text.   |
+| Field            | Type          | Description                                                                                                                                               |
+| ---------------- | ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `resource`       | Node          | The resource reached.                                                                                                                                     |
+| `level`          | string        | Resolved access level: `standing`, `impersonate`, `request`, or `denied` (see _Levels_).                                                                  |
+| `temporary`      | bool          | `true` when the access is self-expiring (granted by an access request). Rendered as a `*` in text.                                                        |
 | `grantor_counts` | GrantorCounts | How many grantors back this access at each level (`standing`/`impersonate`/`request`). Denied grantors are listed in `grantors` but **not** counted here. |
-| `grantors`  | Grantor[] | The identity-group node(s) (access list / role / access request) that grant or deny the access.      |
-| `activity`  | Activity  | Present only with a time window (`--from`/`--to`). Access count and last-access time over the window. |
+| `grantors`       | Grantor[]     | The identity-group node(s) (access list / role / access request) that grant or deny the access.                                                           |
+| `activity`       | Activity      | Present only with a time window (`--from`/`--to`). Access count and last-access time over the window.                                                     |
 
 ### GrantorCounts
 
@@ -54,25 +54,25 @@ still returned.
 
 Used for identities, resources, and grantors.
 
-| Field       | Type   | Description                                                                       |
-| ----------- | ------ | --------------------------------------------------------------------------------- |
-| `id`        | string | Node UUID. Filterable via the `id` column (see [QUERY.md](QUERY.md)).             |
-| `name`      | string | The node's name **as stored** — what `=`/`IN` match against (exactly, case-sensitively). |
-| `alias`     | string | Optional friendly alias; also matched by name filters.                            |
-| `kind`      | string | `identity`, `resource`, `identity_group`, `resource_group`, `sub_resource`, …     |
+| Field       | Type   | Description                                                                                                                                              |
+| ----------- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`        | string | Node UUID. Filterable via the `id` column (see [QUERY.md](QUERY.md)).                                                                                    |
+| `name`      | string | The node's name **as stored** — what `=`/`IN` match against (exactly, case-sensitively).                                                                 |
+| `alias`     | string | Optional friendly alias; also matched by name filters.                                                                                                   |
+| `kind`      | string | `identity`, `resource`, `identity_group`, `resource_group`, `sub_resource`, …                                                                            |
 | `sub_kind`  | string | e.g. identity → `user`/`bot`; resource → `ssh`/`db`/`app`/`kube`/`s3`; group → `role`/`access_list`/`access_request`. The text `Kind` columns show this. |
-| `source`    | string | Origin system, e.g. `TELEPORT`, `OKTA`.                                           |
-| `origin`    | string | Finer origin, e.g. `teleport_user`.                                               |
-| `temporary` | bool   | For a grantor, `true` if created by an access request (self-expiring).            |
+| `source`    | string | Origin system, e.g. `TELEPORT`, `OKTA`.                                                                                                                  |
+| `origin`    | string | Finer origin, e.g. `teleport_user`.                                                                                                                      |
+| `temporary` | bool   | For a grantor, `true` if created by an access request (self-expiring).                                                                                   |
 
 ## Levels
 
-| Level         | Meaning                                                                                              |
-| ------------- | ---------------------------------------------------------------------------------------------------- |
-| `standing`    | The identity holds the access directly, no action required.                                          |
-| `impersonate` | Reachable only by minting a certificate to impersonate another identity (no approval needed).        |
-| `request`     | Reachable only after an approved access request.                                                     |
-| `denied`      | A deny rule blocks the access. Any denied path wins over everything else.                            |
+| Level         | Meaning                                                                                       |
+| ------------- | --------------------------------------------------------------------------------------------- |
+| `standing`    | The identity holds the access directly, no action required.                                   |
+| `impersonate` | Reachable only by minting a certificate to impersonate another identity (no approval needed). |
+| `request`     | Reachable only after an approved access request.                                              |
+| `denied`      | A deny rule blocks the access. Any denied path wins over everything else.                     |
 
 A trailing `*` on the level in text output marks `temporary` (self-expiring)
 access — distinguish it from standing membership so you don't trim access that
