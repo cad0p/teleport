@@ -24,7 +24,7 @@ object:
 | `level`          | string        | Resolved access level: `standing`, `impersonate`, `request`, or `denied` (see _Levels_).                                                                  |
 | `temporary`      | bool          | `true` when the access is self-expiring (granted by an access request). Rendered as a `*` in text.                                                        |
 | `grantor_counts` | GrantorCounts | How many grantors back this access at each level (`standing`/`impersonate`/`request`). Denied grantors are listed in `grantors` but **not** counted here. |
-| `grantors`       | Grantor[]     | The identity-group node(s) (access list / role / access request) that grant or deny the access.                                                           |
+| `grantors`       | Grantor[]     | The identity-group node(s) (access list / role / access request) that grant or deny the access. Ordered primary-first: `grantors[0]` is the grantor backing the resolved `level`. |
 | `activity`       | Activity      | Present only with a time window (`--from`/`--to`). Access count and last-access time over the window.                                                     |
 
 ### GrantorCounts
@@ -40,7 +40,11 @@ revoke the access. In text, shown under the `Grantor Counts` column as e.g.
 `{ node: Node, level: string }` — the attributing identity-group node and the
 level **it** contributes. The row's resolved `level` is the strongest across all
 its grantors (priority `denied > standing > impersonate > request`); a grantor's
-own `level` can differ (this is what `--detailed` exposes).
+own `level` can differ (this is what `--detailed` exposes). The list is returned
+in a stable order — by `level` priority, then permanent before temporary, then
+name, then `id` — so `grantors[0]` is the strongest-priority grantor, i.e. the
+one whose `level` equals the resolved `level`. Act on it when acting on the
+resolved access.
 
 ### Activity
 

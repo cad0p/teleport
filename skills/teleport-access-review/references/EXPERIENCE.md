@@ -52,7 +52,8 @@ $TCTL access-review --from 90d \
 
 ### 3. Use `--detailed` when "how" has more than one answer
 
-The summary shows the primary grantor. When a pair is granted by several
+The summary shows the primary grantor — `grantors[0]`, the one backing the
+resolved level. When a pair is granted by several
 grantors and you need to see each one and its level (e.g. standing via a role
 _and_ request via a break-glass list), switch to `--detailed`.
 
@@ -176,7 +177,8 @@ split used from unused. Avoid hedging: enumerate what _is_ known.
 # Save the pull to a private scratch file
 f=$(mktemp) && $TCTL access-review --from 90d \
   --query "SELECT * FROM access_path WHERE identity = 'alice@example.com'" --format json > "$f"
-# Standing access never used in the window — candidates to revoke, with the grantor to act on:
+# Standing access never used in the window — candidates to revoke, with the grantor
+# to act on (grantors[0] is the primary grantor, i.e. the one backing the standing level):
 jq -r '.identities[].resources[]
        | select(.level=="standing" and (.activity.count // 0)==0 and (.temporary|not))
        | [(.resource.alias // .resource.name), .resource.sub_kind, (.grantors[0].node | .alias // .name // "?")] | @tsv' "$f"
