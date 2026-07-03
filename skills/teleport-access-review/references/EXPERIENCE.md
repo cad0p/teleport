@@ -139,7 +139,7 @@ de-listing candidate.
 Scope by the resource; no window needed if you only care about _who_ and _how_:
 
 ```sh
-$TCTL access-review --query "SELECT * FROM access_path WHERE resource ILIKE 'prod-db%'" --format json \
+$TCTL access-review --query "SELECT * FROM access_path WHERE resource = 'prod-db'" --format json \
   | jq -r '.identities[] | select(.resources|length>0) | .resources[0] as $r
            | [(.identity.alias // .identity.name), $r.level, ($r.grantors[0].node | .alias // .name)] | @tsv'
 ```
@@ -154,10 +154,16 @@ rows explicitly: a deny means they are blocked, not allowed.
 Add the window and read the activity, but mind the boundary with `investigate`:
 
 ```sh
-$TCTL access-review --from 90d --query "SELECT * FROM access_path WHERE resource ILIKE 'prod-db%'" --format json \
+$TCTL access-review --from 90d --query "SELECT * FROM access_path WHERE resource = 'prod-db'" --format json \
   | jq -r '.identities[] | (.identity.alias // .identity.name) as $i | .resources[]
            | select((.activity.count // 0) > 0) | [$i, .activity.count, .activity.last_access] | @tsv'
 ```
+
+The `// 0` treats missing `activity` as zero, which is only correct once you've
+ruled out an activity outage. If Identity Activity Center is unavailable the
+pull carries an `activity unavailable` root warning and omits activity on every
+row — check `.warnings` first (as the unused-access flow below does), or you'll
+read an outage as "nobody used it".
 
 **`access-review` only counts usage on access paths that still exist.** If
 someone accessed prod-db and their access was _since removed_, the pair has no
