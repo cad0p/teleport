@@ -121,7 +121,16 @@ func platformConfigureOS(ctx context.Context, cfg *osConfig, state *platformOSCo
 		if err := runCommand(ctx,
 			"netsh", "interface", "ipv6", "set", "address", cfg.tunName, cfg.tunIPv6,
 		); err != nil {
-			return trace.Wrap(err)
+			ipv6Disabled, checkErr := hostIPv6Disabled()
+			if checkErr != nil {
+				return trace.NewAggregate(err, trace.Wrap(checkErr, "checking whether IPv6 is disabled on the host"))
+			}
+			if !ipv6Disabled {
+				return trace.Wrap(err)
+			}
+			// IPv6 is disabled on this host, VNet still works over IPv4, so just log and error, and proceed.
+			log.WarnContext(ctx, "IPv6 is disabled on this host, skipping IPv6 configuration for the TUN device.",
+				"device", cfg.tunName, "error", err)
 		}
 		state.configuredV6Address = true
 	}
@@ -182,6 +191,9 @@ const (
 	// The UUID at the end was randomly generated once, VNet
 	// always writes policies at this key and cleans it up on shutdown.
 	vnetNRPTKeyID = `{ad074e9a-bd1b-447e-9108-14e545bf11a5}`
+
+	// This key holds host IPv6 configuration.
+	tcpip6ParametersKey = `SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters`
 )
 
 func configureDNS(ctx context.Context, zones, nameservers []string, doesGroupPolicyKeyExist bool) error {
@@ -215,6 +227,36 @@ func configureDNS(ctx context.Context, zones, nameservers []string, doesGroupPol
 		return trace.Wrap(err, "refreshing computer policies")
 	}
 	return nil
+}
+
+// hostIPv6Disabled checks whether IPv6 has been disabled on the host via the
+// DisabledComponents value under tcpip6ParametersKey.
+func hostIPv6Disabled() (bool, error) {
+	// Bit 0x10 disables IPv6 on all non-tunnel interfaces, checking it also
+	// covers 0xFF bit that disables IPv6 entirely. Absent key or value means
+	// that IPv6 is enabled.
+	//
+	// "Tunnel" interfaces here refers to Microsoft's tunneling protocols (6to4/ISATAP/Teredo)
+	// that encapsulate IPv6 packets inside IPv4. VNet's TUN device doesn't fall under this category.
+	//
+	// https://learn.microsoft.com/en-us/troubleshoot/windows-server/networking/configure-ipv6-in-windows#ipv6-tunnel-interfaces
+	const disableIPv6NontunnelBit = 0x10
+	key, err := registry.OpenKey(registry.LOCAL_MACHINE, tcpip6ParametersKey, registry.QUERY_VALUE)
+	if err != nil {
+		if errors.Is(err, registry.ErrNotExist) {
+			return false, nil
+		}
+		return false, trace.Wrap(err, "opening registry key %s", tcpip6ParametersKey)
+	}
+	defer key.Close()
+	val, _, err := key.GetIntegerValue("DisabledComponents")
+	if err != nil {
+		if errors.Is(err, registry.ErrNotExist) {
+			return false, nil
+		}
+		return false, trace.Wrap(err, "reading DisabledComponents registry value")
+	}
+	return val&disableIPv6NontunnelBit != 0, nil
 }
 
 func doesKeyPathExist(k registry.Key, path string) (bool, error) {
