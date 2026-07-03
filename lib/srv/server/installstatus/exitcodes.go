@@ -29,11 +29,13 @@ type ExitCode int
 
 const (
 	// Preflight exit codes (shell-side, 100–149).
-	BashNotFound          ExitCode = 100
-	SudoNotFound          ExitCode = 101
-	CurlNotFound          ExitCode = 102
-	InsufficientDiskSpace ExitCode = 103
-	ProxyPingError        ExitCode = 104
+	BashNotFound             ExitCode = 100
+	SudoNotFound             ExitCode = 101
+	CurlNotFound             ExitCode = 102
+	InsufficientDiskSpace    ExitCode = 103
+	ProxyPingError           ExitCode = 104
+	PowerShellNotFound       ExitCode = 105
+	InvokeWebRequestNotFound ExitCode = 106
 
 	// Post-install exit codes (Go binary, 150–199).
 	JoinFailure ExitCode = 150

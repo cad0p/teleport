@@ -70,6 +70,50 @@ func envVarsFromInstallerParams(params *types.InstallerParams) []string {
 	return envVars
 }
 
+// escapePowerShellSingleQuoted wraps s in a PowerShell single-quoted string
+// literal. Inside single quotes PowerShell treats every character literally
+// except a single quote, which is escaped by doubling it. This prevents
+// interpolation and command injection regardless of the input.
+func escapePowerShellSingleQuoted(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// envVarsFromInstallerParamsWindows converts InstallerParams into a list of
+// PowerShell statements that set environment variables for the current process,
+// in the form $env:KEY = 'value'. Child processes (i.e. the downloaded
+// installer) inherit these. The output can be used as is without further
+// escaping in scripts.
+func envVarsFromInstallerParamsWindows(params *types.InstallerParams) []string {
+	var envVars []string
+
+	// InstallSuffix and UpdateGroup only contains alphanumeric characters and hyphens.
+	// Escape them anyway as another layer of safety.
+	setEnv := func(key, value string) {
+		envVars = append(envVars, fmt.Sprintf("$env:%s = %s", key, escapePowerShellSingleQuoted(value)))
+	}
+
+	if params.Suffix != "" {
+		setEnv("TELEPORT_INSTALL_SUFFIX", params.Suffix)
+	}
+	if params.UpdateGroup != "" {
+		setEnv("TELEPORT_UPDATE_GROUP", params.UpdateGroup)
+	}
+
+	if params.HTTPProxySettings != nil {
+		if params.HTTPProxySettings.HTTPProxy != "" {
+			setEnv("HTTP_PROXY", params.HTTPProxySettings.HTTPProxy)
+		}
+		if params.HTTPProxySettings.HTTPSProxy != "" {
+			setEnv("HTTPS_PROXY", params.HTTPProxySettings.HTTPSProxy)
+		}
+		if params.HTTPProxySettings.NoProxy != "" {
+			setEnv("NO_PROXY", params.HTTPProxySettings.NoProxy)
+		}
+	}
+
+	return envVars
+}
+
 type scriptOption func(*scriptOptions) *scriptOptions
 type scriptOptions struct {
 	addNonceComment bool
@@ -109,19 +153,22 @@ func proxyAddress(ctx context.Context, proxyAddr string, getter proxyGetter) (st
 	return "", trace.BadParameter("proxy address is missing from the matcher and there is no available Proxy Service yet")
 }
 
-func installerScript(ctx context.Context, params *types.InstallerParams, opts ...scriptOption) (string, error) {
+// resolveInstallerScript parses options, validates params, resolves the proxy
+// address, and builds the installer script URL. These steps are shared by all
+// platform-specific installer script builders.
+func resolveInstallerScript(ctx context.Context, params *types.InstallerParams, opts ...scriptOption) (proxyAddr, scriptURL string, o *scriptOptions, err error) {
 	scriptOptions := &scriptOptions{}
 	for _, opt := range opts {
 		scriptOptions = opt(scriptOptions)
 	}
 
 	if params == nil {
-		return "", trace.BadParameter("installation parameters must not be nil")
+		return "", "", nil, trace.BadParameter("installation parameters must not be nil")
 	}
 
-	proxyAddr, err := proxyAddress(ctx, params.PublicProxyAddr, scriptOptions.proxyAddr)
+	proxyAddr, err = proxyAddress(ctx, params.PublicProxyAddr, scriptOptions.proxyAddr)
 	if err != nil {
-		return "", trace.Wrap(err)
+		return "", "", nil, trace.Wrap(err)
 	}
 
 	scriptURLQuery := url.Values{}
@@ -129,11 +176,20 @@ func installerScript(ctx context.Context, params *types.InstallerParams, opts ..
 		scriptURLQuery.Set("azure-client-id", shsprintf.EscapeDefaultContext(params.Azure.ClientID))
 	}
 
-	scriptURL := url.URL{
+	u := url.URL{
 		Scheme:   "https",
 		Host:     proxyAddr,
 		Path:     path.Join("v1", "webapi", "scripts", "installer", shsprintf.EscapeDefaultContext(params.ScriptName)),
 		RawQuery: scriptURLQuery.Encode(),
+	}
+
+	return proxyAddr, u.String(), scriptOptions, nil
+}
+
+func installerScript(ctx context.Context, params *types.InstallerParams, opts ...scriptOption) (string, error) {
+	proxyAddr, scriptURL, scriptOptions, err := resolveInstallerScript(ctx, params, opts...)
+	if err != nil {
+		return "", trace.Wrap(err)
 	}
 
 	var installationScript string
@@ -144,10 +200,10 @@ func installerScript(ctx context.Context, params *types.InstallerParams, opts ..
 		installationScript += fmt.Sprintf("export %s; ", strings.Join(envVars, " "))
 	}
 
-	installationScript += preFlightChecksScript(proxyAddr)
+	installationScript += preFlightChecksScript(preFlightInstallerChecks(proxyAddr))
 
 	installationScript += fmt.Sprintf(`bash -c "set -o pipefail; curl --silent --show-error --location %s | bash -s %s"`,
-		scriptURL.String(),
+		scriptURL,
 		shsprintf.EscapeDefaultContext(params.JoinToken),
 	)
 
@@ -161,17 +217,18 @@ func installerScript(ctx context.Context, params *types.InstallerParams, opts ..
 	return installationScript, nil
 }
 
-// preFlightChecksScript returns a shell script fragment that performs pre-installation checks.
-// Each check exits with a specific non-zero code so the Discovery Service can identify the failure.
-func preFlightChecksScript(proxyAddr string) string {
-	installersCheckMap := preFlightInstallerChecks(proxyAddr)
-
-	exitCodes := slices.Collect(maps.Keys(installersCheckMap))
+// preFlightChecksScript renders a map of pre-installation checks into a script
+// fragment. Checks are emitted ordered by exit code so the output is
+// deterministic, and joined with "; " (a statement separator in both sh and
+// PowerShell). Each check exits with a specific non-zero code so the Discovery
+// Service can identify the failure.
+func preFlightChecksScript(checks map[installstatus.ExitCode]string) string {
+	exitCodes := slices.Collect(maps.Keys(checks))
 	slices.Sort(exitCodes)
 
 	var checkScriptFragments []string
 	for _, exitCode := range exitCodes {
-		checkScriptFragments = append(checkScriptFragments, installersCheckMap[exitCode])
+		checkScriptFragments = append(checkScriptFragments, checks[exitCode])
 	}
 
 	return strings.Join(checkScriptFragments, "; ") + "; "
@@ -208,5 +265,41 @@ func preFlightInstallerChecks(proxyAddr string) map[installstatus.ExitCode]strin
 			shsprintf.EscapeDefaultContext(proxyFindURL.String()),
 			orExitWithMessageScriptSnippet(installstatus.ProxyPingError, "proxy is unreachable"),
 		),
+	}
+}
+
+func installerScriptWindowsDesktop(ctx context.Context, params *types.InstallerParams, opts ...scriptOption) (string, error) {
+	proxyAddr, scriptURL, scriptOptions, err := resolveInstallerScript(ctx, params, opts...)
+	if err != nil {
+		return "", trace.Wrap(err)
+	}
+	var installationScript string
+
+	// Export env vars before pre flight checks so that proxy network check can
+	// use http proxy settings if they are provided in the installer params.
+	envVars := envVarsFromInstallerParamsWindows(params)
+	if len(envVars) > 0 {
+		installationScript += strings.Join(envVars, "; ") + "; "
+	}
+
+	installationScript += preFlightChecksScript(preFlightInstallerChecksWindows(proxyAddr))
+
+}
+
+func preFlightInstallerChecksWindows(proxyAddr string) map[installstatus.ExitCode]string {
+	proxyFindURL := url.URL{
+		Scheme: "https",
+		Host:   proxyAddr,
+		Path:   path.Join("webapi", "find"),
+	}
+
+	orExitWithMessageScriptSnippet := func(exitCode installstatus.ExitCode, message string) string {
+		return fmt.Sprintf(`|| { Write-Host "%s"; exit %d; }`, message, exitCode)
+	}
+
+	return map[installstatus.ExitCode]string{
+		// Basic command checks for PowerShell, Invoke-WebRequest
+		installstatus.PowerShellNotFound:       fmt.Sprintf(`if (-not (Get-Command powershell -ErrorAction SilentlyContinue)) { Write-Host "PowerShell is missing"; exit %d; }`, installstatus.PowerShellNotFound),
+		installstatus.InvokeWebRequestNotFound: fmt.Sprintf(`if (-not (Get-Command Invoke-WebRequest -ErrorAction SilentlyContinue)) { Write-Host "Invoke-WebRequest is missing"; exit %d; }`, installstatus.InvokeWebRequestNotFound),
 	}
 }

@@ -27,6 +27,41 @@ import (
 )
 
 const (
+	windowsScriptSetup = `$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+$ProxyAddr = '{{.PublicProxyAddr}}'
+$Version = '{{.Version}}'
+$CA = '{{.CA}}'`
+
+	windowsInstallerScript = `$InstallerName = "teleport-windows-auth-setup-v$Version-amd64.exe"
+$WorkDir       = Join-Path $env:TEMP 'teleport-wap-install'
+New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
+$InstallerPath = Join-Path $WorkDir $InstallerName
+$CertPath      = Join-Path $WorkDir 'teleport.cer'
+
+Write-Host "Downloading WAP installer ($InstallerName)..."
+try {
+    Invoke-WebRequest -Uri "https://cdn.teleport.dev/$InstallerName" -OutFile $InstallerPath -UseBasicParsing
+} catch {
+    throw "WAP download failed: $_"
+}
+
+Write-Host "Fetching cluster CA from $ProxyAddr..."
+try {
+    Invoke-WebRequest -Uri "https://$ProxyAddr/webapi/auth/export?type=windows" -OutFile $CertPath -UseBasicParsing
+} catch {
+    throw "CA download failed: $_"
+}
+
+Write-Host "Running WAP installer..."
+& $InstallerPath install --cert=$CertPath -r
+if ($LASTEXITCODE -ne 0) { throw "WAP installer failed (exit $LASTEXITCODE)" }
+
+Write-Host "Teleport WAP installed successfully."`
+)
+
+const (
 	scriptShebangAndSetOptions = `#!/usr/bin/env sh
 set -eu`
 	execGenericInstallScript = `

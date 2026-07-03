@@ -21,6 +21,7 @@
 package web
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"crypto/tls"
@@ -2618,7 +2619,26 @@ func (h *Handler) installer(w http.ResponseWriter, r *http.Request, p httprouter
 		targetVersion = teleport.SemVer()
 	}
 
-	instTmpl, err := texttemplate.New("").Parse(installer.GetScript())
+	getWindowsCA := func() (string, error) {
+		authorities, err := client.ExportAllAuthorities(
+			r.Context(),
+			h.GetProxyClient(),
+			client.ExportAuthoritiesRequest{
+				AuthType: "windows",
+			},
+		)
+		if err != nil {
+			return "", trace.Wrap(err)
+		}
+		if len(authorities) != 1 {
+			return "", trace.BadParameter("expected exactly one Windows CA, got %d", len(authorities))
+		}
+		return base64.StdEncoding.EncodeToString(authorities[0].Data), nil
+	}
+
+	instTmpl, err := texttemplate.New("").
+		Funcs(texttemplate.FuncMap{"getWindowsCA": getWindowsCA}).
+		Parse(installer.GetScript())
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -2650,9 +2670,18 @@ func (h *Handler) installer(w http.ResponseWriter, r *http.Request, p httprouter
 		RepoChannel:       shsprintf.EscapeDefaultContext(repoChannel),
 		AutomaticUpgrades: strconv.FormatBool(installUpdater),
 		AzureClientID:     shsprintf.EscapeDefaultContext(azureClientID),
+		Version:           shsprintf.EscapeDefaultContext(targetVersion.String()),
 	}
-	err = instTmpl.Execute(w, tmpl)
-	return nil, trace.Wrap(err)
+
+	var buf bytes.Buffer
+	if err := instTmpl.Execute(&buf, tmpl); err != nil {
+		return nil, trace.Wrap(err)
+	}
+	if _, err := io.Copy(w, &buf); err != nil {
+		h.logger.DebugContext(r.Context(), "Failed writing installer script response", "error", err)
+	}
+	return nil, nil
+
 }
 
 // AuthParams are used to construct redirect URL containing auth

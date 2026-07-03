@@ -33,6 +33,10 @@ const InstallerScriptName = types.DefaultInstallerScriptName
 // installer script when agentless mode is enabled for a matcher
 const InstallerScriptNameAgentless = types.DefaultInstallerScriptNameAgentless
 
+// InstallerScriptNameWindows is the name of the default populated Windows
+// installer script
+const InstallerScriptNameWindows = types.DefaultInstallerScriptNameWindows
+
 // DefaultAgentlessInstaller represents a the default agentless installer script provided
 // by teleport
 var DefaultAgentlessInstaller = types.MustNewInstallerV1(InstallerScriptNameAgentless, defaultAgentlessInstallScript)
@@ -55,4 +59,9 @@ type Template struct {
 	// AzureClientID is the client ID of the managed identity to use when joining
 	// the cluster. Only applicable for the azure join method.
 	AzureClientID string
+	// Version is the full version of Teleport auth node e.g. 18.9.2
+	Version string
+	// WindowsCA is the base64-encoded (DER) Windows CA certificate. Only set for the
+	// Windows installer.
+	WindowsCA string
 }
