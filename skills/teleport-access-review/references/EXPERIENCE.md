@@ -177,14 +177,24 @@ split used from unused. Avoid hedging: enumerate what _is_ known.
 # Save the pull to a private scratch file
 f=$(mktemp) && $TCTL access-review --from 90d \
   --query "SELECT * FROM access_path WHERE identity = 'alice@example.com'" --format json > "$f"
-# Standing access never used in the window — candidates to revoke, with the grantor
-# to act on (grantors[0] is the primary grantor, i.e. the one backing the standing level):
-jq -r '.identities[].resources[]
-       | select(.level=="standing" and (.activity.count // 0)==0 and (.temporary|not))
-       | [(.resource.alias // .resource.name), .resource.sub_kind, (.grantors[0].node | .alias // .name // "?")] | @tsv' "$f"
-# Used standing access — keep:
-jq -r '.identities[].resources[] | select(.level=="standing" and (.activity.count // 0)>0)
-       | [(.resource.alias // .resource.name), .activity.count, .activity.last_access] | @tsv' "$f"
+# Activity is what separates used from unused, but two very different states both
+# leave `activity` absent: a genuinely unused pair (IAC succeeded, zero events) and
+# an IAC outage (no data at all). Gate on the warning first — if the lookup failed,
+# every row would look unused, so bail out rather than recommend revocations you
+# can't back up. Once the outage is ruled out, absent activity *is* zero.
+if jq -e '(.warnings // []) | any(test("activity unavailable"))' "$f" >/dev/null; then
+  echo "activity unavailable — cannot classify unused access; see .warnings"
+else
+  # Standing access never used in the window — candidates to revoke, with the grantor
+  # to act on (grantors[0] is the primary grantor, i.e. the one backing the standing
+  # level). Missing `activity` means zero events here, so `// 0` is correct:
+  jq -r '.identities[].resources[]
+         | select(.level=="standing" and (.activity.count // 0)==0 and (.temporary|not))
+         | [(.resource.alias // .resource.name), .resource.sub_kind, (.grantors[0].node | .alias // .name // "?")] | @tsv' "$f"
+  # Used standing access — keep:
+  jq -r '.identities[].resources[] | select(.level=="standing" and (.activity.count // 0)>0)
+         | [(.resource.alias // .resource.name), .activity.count, .activity.last_access] | @tsv' "$f"
+fi
 # rm "$f" when done.
 ```
 
