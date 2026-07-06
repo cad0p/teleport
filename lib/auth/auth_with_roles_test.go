@@ -13820,8 +13820,21 @@ func TestRoleAppLeastPrivilege(t *testing.T) {
 		}
 	}
 
+	// legacyAppKeepAlive builds a pre-9.0 style keepalive with an empty HostID,
+	// exercising the fallback branch in KeepAliveServer that authorizes on Name.
+	legacyAppKeepAlive := func(name string) types.KeepAlive {
+		return types.KeepAlive{
+			Type:      types.KeepAlive_APP,
+			Name:      name,
+			Namespace: apidefaults.Namespace,
+			Expires:   time.Now().Add(5 * time.Minute),
+		}
+	}
+
 	// app is authenticated as the built-in RoleApp for ownID.
 	app := newScopedTestServerForHost(t, as, ownID, "" /* scope */, types.RoleApp)
+	// okta is authenticated as the built-in RoleOkta for ownID.
+	okta := newScopedTestServerForHost(t, as, ownID, "" /* scope */, types.RoleOkta)
 
 	t.Run("upsert own app server allowed", func(t *testing.T) {
 		_, err := app.UpsertApplicationServer(ctx, makeAppServer(t, ownID))
@@ -13839,6 +13852,28 @@ func TestRoleAppLeastPrivilege(t *testing.T) {
 
 	t.Run("keepalive other app server denied", func(t *testing.T) {
 		err := app.KeepAliveServer(ctx, appKeepAlive(otherID))
+		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
+	})
+
+	t.Run("okta keepalive own app server allowed", func(t *testing.T) {
+		require.NoError(t, okta.KeepAliveServer(ctx, appKeepAlive(ownID)))
+	})
+
+	t.Run("okta keepalive other app server denied", func(t *testing.T) {
+		err := okta.KeepAliveServer(ctx, appKeepAlive(otherID))
+		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
+	})
+
+	t.Run("legacy keepalive own app server allowed", func(t *testing.T) {
+		// The pre-9.0 keepalive format has no HostID; the ownership check is
+		// keyed on handle.Name. Assert authorization succeeds even if the
+		// backend has no legacy-format server to update.
+		err := app.KeepAliveServer(ctx, legacyAppKeepAlive(ownID))
+		require.False(t, trace.IsAccessDenied(err), "unexpected access denied: %v", err)
+	})
+
+	t.Run("legacy keepalive other app server denied", func(t *testing.T) {
+		err := app.KeepAliveServer(ctx, legacyAppKeepAlive(otherID))
 		require.True(t, trace.IsAccessDenied(err), "expected access denied, got: %v", err)
 	})
 
