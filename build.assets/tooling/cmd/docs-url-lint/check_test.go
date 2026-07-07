@@ -46,7 +46,6 @@ func TestCheckTargets(t *testing.T) {
 		want    []Finding
 	}{
 		// TODO: add cases for:
-		// - BadParameter call with no docs URL, but outside a target function (no findings)
 		// - BadParameter call with a docs URL via a named constant (no findings; needs either
 		//   real type-checking in the test harness, or a same-file AST scan for const decls)
 		// - docs URL split across a string concatenation (`"a" + "b" + url`), e.g. mirroring
@@ -85,6 +84,26 @@ import "github.com/gravitational/trace"
 
 func onExample() error {
 	return trace.BadParameter("something went wrong, see https://goteleport.com/docs/reference/example/ for details")
+}
+`,
+			targets: []Target{
+				{Package: "p", Function: "onExample"},
+			},
+			want: nil,
+		},
+		{
+			name:    "violation outside target function",
+			pkgPath: "p",
+			src: `package p
+
+import "github.com/gravitational/trace"
+
+func onExample() error {
+	return nil
+}
+
+func notATarget() error {
+	return trace.BadParameter("something went wrong")
 }
 `,
 			targets: []Target{
