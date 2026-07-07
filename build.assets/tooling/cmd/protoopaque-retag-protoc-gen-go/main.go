@@ -1,131 +1,122 @@
-// Copyright 2018 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file at
-// https://github.com/protocolbuffers/protobuf-go/blob/v1.36.11/LICENSE
+// Teleport
+// Copyright (C) 2026 Gravitational, Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package main
 
 import (
-	"fmt"
 	"io"
 	"os"
 	"strings"
 
-	gengo "google.golang.org/protobuf/cmd/protoc-gen-go/internal_gengo"
-	"google.golang.org/protobuf/compiler/protogen"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/pluginpb"
 )
 
 func main() {
-	protogenRunWithPost(protogen.Options{}, func(gen *protogen.Plugin) error {
-		// taken from google.golang.org/protobuf/cmd/protoc-gen-go
-		for _, f := range gen.Files {
-			if f.Generate {
-				gengo.GenerateFile(gen, f)
-			}
+	// protoc generators are programs that read a
+	// google.protobuf.compiler.CodeGeneratorRequest message from stdin and
+	// output a google.protobuf.compiler.CodeGeneratorResponse message to
+	// stdout; we're interested in tweaking the output of protoc-gen-go but
+	// there's no supported way to embed protoc-gen-go in code, so instead we
+	// act as a filter to its output, reading the original
+	// CodeGeneratorResponse, tweaking it, and writing the modified response to
+	// stdout
+
+	inBuf, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		panic(err)
+	}
+
+	cgr := new(pluginpb.CodeGeneratorResponse)
+	if err := proto.Unmarshal(inBuf, cgr); err != nil {
+		panic(err)
+	}
+
+	if cgr.GetError() != "" {
+		// code generation failed, forward the response as is
+		if _, err := os.Stdout.Write(inBuf); err != nil {
+			panic(err)
 		}
-		gen.SupportedFeatures = gengo.SupportedFeatures
-		gen.SupportedEditionsMinimum = gengo.SupportedEditionsMinimum
-		gen.SupportedEditionsMaximum = gengo.SupportedEditionsMaximum
-		return nil
-	}, func(cgr *pluginpb.CodeGeneratorResponse) {
-		for _, file := range cgr.GetFile() {
-			if file.Name == nil {
-				panic("got chunked output from protoc-gen-go")
+		return
+	}
+
+	for _, file := range cgr.GetFile() {
+		if file.Name == nil {
+			panic("got chunked output from protoc-gen-go")
+		}
+		if file.InsertionPoint != nil {
+			panic("got insertion point in file from protoc-gen-go")
+		}
+		if !strings.HasSuffix(file.GetName(), ".pb.go") {
+			panic("got file without .pb.go suffix from protoc-gen-go")
+		}
+
+		prefix, isProtoOpaque := strings.CutSuffix(file.GetName(), "_protoopaque.pb.go")
+		if !isProtoOpaque {
+			prefix = strings.TrimSuffix(file.GetName(), ".pb.go")
+		}
+
+		defaultHybrid := defaultHybridFromPrefix(prefix)
+
+		if isProtoOpaque {
+			before, after, ok := strings.Cut(file.GetContent(), "//go:build protoopaque\n")
+			if !ok {
+				panic("got protoopaque file without protoopaque built tag")
 			}
-			if file.InsertionPoint != nil {
-				panic("got insertion point in file from protoc-gen-go")
-			}
-			if !strings.HasSuffix(file.GetName(), ".pb.go") {
-				panic("got file without .pb.go suffix from protoc-gen-go")
-			}
-			file.GeneratedCodeInfo = nil
 
-			prefix, isProtoOpaque := strings.CutSuffix(file.GetName(), "_protoopaque.pb.go")
-			if !isProtoOpaque {
-				prefix = strings.TrimSuffix(file.GetName(), ".pb.go")
-			}
+			proto.Reset(file)
 
-			defaultHybrid := defaultHybridFromPrefix(prefix)
+			newName := prefix + "_protoopaque.pb.go"
+			file.Name = &newName
 
-			if isProtoOpaque {
-				before, after, ok := strings.Cut(file.GetContent(), "//go:build protoopaque\n")
-				if !ok {
-					panic("got protoopaque file without protoopaque built tag")
-				}
-
-				var newContent string
-				if defaultHybrid {
-					newContent = before + "//go:build teleport_protoopaque\n" + after
-				} else {
-					newContent = before + "//go:build !teleport_protohybrid\n" + after
-				}
-				file.Content = &newContent
-
-				newName := prefix + "_protoopaque.pb.go"
-				file.Name = &newName
+			var newContent string
+			if defaultHybrid {
+				newContent = before + "//go:build teleport_protoopaque\n" + after
 			} else {
-				before, after, ok := strings.Cut(file.GetContent(), "//go:build !protoopaque\n")
-				if !ok {
-					panic("got non-protoopaque file without !protoopaque built tag")
-				}
-
-				var newContent string
-				if defaultHybrid {
-					newContent = before + "//go:build !teleport_protoopaque\n" + after
-				} else {
-					newContent = before + "//go:build teleport_protohybrid\n" + after
-				}
-				file.Content = &newContent
-
-				newName := prefix + "_protohybrid.pb.go"
-				file.Name = &newName
+				newContent = before + "//go:build !teleport_protohybrid\n" + after
 			}
+			file.Content = &newContent
+		} else {
+			before, after, ok := strings.Cut(file.GetContent(), "//go:build !protoopaque\n")
+			if !ok {
+				panic("got non-protoopaque file without !protoopaque built tag")
+			}
+
+			proto.Reset(file)
+
+			newName := prefix + "_protohybrid.pb.go"
+			file.Name = &newName
+
+			var newContent string
+			if defaultHybrid {
+				newContent = before + "//go:build !teleport_protoopaque\n" + after
+			} else {
+				newContent = before + "//go:build teleport_protohybrid\n" + after
+			}
+			file.Content = &newContent
 		}
-	})
-}
-
-func protogenRunWithPost(opts protogen.Options, f func(*protogen.Plugin) error, post func(*pluginpb.CodeGeneratorResponse)) error {
-	// taken from google.golang.org/protobuf/compiler/protogen
-	if len(os.Args) > 1 {
-		return fmt.Errorf("unknown argument %q (this program should be run by protoc, not directly)", os.Args[1])
-	}
-	in, err := io.ReadAll(os.Stdin)
-	if err != nil {
-		return err
-	}
-	req := &pluginpb.CodeGeneratorRequest{}
-	if err := proto.Unmarshal(in, req); err != nil {
-		return err
-	}
-	gen, err := opts.New(req)
-	if err != nil {
-		return err
-	}
-	if err := f(gen); err != nil {
-		// Errors from the plugin function are reported by setting the
-		// error field in the CodeGeneratorResponse.
-		//
-		// In contrast, errors that indicate a problem in protoc
-		// itself (unparsable input, I/O errors, etc.) are reported
-		// to stderr.
-		gen.Error(err)
-	}
-	resp := gen.Response()
-
-	if resp.Error == nil {
-		post(resp)
 	}
 
-	out, err := proto.Marshal(resp)
+	outBuf, err := proto.Marshal(cgr)
 	if err != nil {
-		return err
+		panic(err)
 	}
-	if _, err := os.Stdout.Write(out); err != nil {
-		return err
+	if _, err := os.Stdout.Write(outBuf); err != nil {
+		panic(err)
 	}
-	return nil
 }
 
 func defaultHybridFromPrefix(prefix string) bool {

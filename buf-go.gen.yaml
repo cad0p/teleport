@@ -25,7 +25,7 @@ plugins:
   - local:
       - sh
       - -c
-      - 'exec "$( GOWORK=off go -C ./build.assets/tooling tool -n github.com/gravitational/teleport/build.assets/tooling/cmd/protoc-gen-go-protoopaque-retag )"'
+      - 'exec go run google.golang.org/protobuf/cmd/protoc-gen-go | "$( GOWORK=off go -C ./build.assets/tooling tool -n github.com/gravitational/teleport/build.assets/tooling/cmd/protoopaque-retag-protoc-gen-go )"'
     out: .
     opt:
       - module=github.com/gravitational/teleport
