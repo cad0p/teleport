@@ -704,6 +704,33 @@ func RetryWithRelogin(ctx context.Context, tc *TeleportClient, fn func() error, 
 
 		return trace.Wrap(fnErr)
 	}
+
+	// Try to get the exclusive lock:
+	//  - if successful, proceed with login, _then_ run the operation
+	//  - if not, wait for read lock. Skip login and run operation
+	unlock, err := utils.FSTryWriteLock("thelock")
+	if err != nil {
+		if !errors.Is(err, utils.ErrUnsuccessfulLockTry) {
+			return trace.Wrap(err, "failed to get login exclusive lock")
+		}
+
+		// Otherwise, we want the shared lock instead.
+		// Once it is available, we'll know we have a fresh login.
+		// TODO: Acquiring the shared lock means that the instance handling
+		// login has exited, but we don't know if it succeeded.
+		unlock, err = utils.FSTryReadLockTimeout(ctx, "thelock", 5*time.Second)
+		if err == nil {
+			// Got the read lock. Unlock immediately because we don't need it.
+			// We just wanted to wait for the previous process or thread to finish logging in.
+			unlock()
+			return fn()
+		}
+		return trace.Wrap(err, "error waiting for login shared lock")
+	}
+	// The "winner" holds the write lock
+	defer unlock()
+
+	// Determined that error is resolvable with relogin.
 	opt := defaultRetryWithReloginOptions()
 	for _, o := range opts {
 		o(opt)
@@ -764,6 +791,9 @@ func RetryWithRelogin(ctx context.Context, tc *TeleportClient, fn func() error, 
 		}
 	}
 
+	// fn() may block indefinitely, so we want to ensure we
+	// release the exclusive lock on the lockfile.
+	unlock()
 	return fn()
 }
 
