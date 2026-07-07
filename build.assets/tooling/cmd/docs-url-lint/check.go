@@ -43,6 +43,8 @@ func checkTargets(pass *analysis.Pass, targets []Target) []Finding {
 		return nil
 	}
 
+	consts := packageConstants(pass.Files)
+
 	var findings []Finding
 	for _, file := range pass.Files {
 		for _, decl := range file.Decls {
@@ -62,10 +64,11 @@ func checkTargets(pass *analysis.Pass, targets []Target) []Finding {
 					return true
 				}
 
-				msg, ok := stringLiteralValue(msgArg)
+				msg, ok := resolveMessage(msgArg, consts)
 				if !ok {
-					// Not a plain string literal (e.g. a variable or a
-					// named constant); can't verify statically yet.
+					// Neither a plain string literal nor a reference to a
+					// resolvable constant (e.g. a local variable, or a
+					// concatenated expression); can't verify statically yet.
 					return true
 				}
 
@@ -111,9 +114,6 @@ func badParameterMessageArg(call *ast.CallExpr) (ast.Expr, bool) {
 
 // stringLiteralValue returns the string value of expr, if expr is a string
 // literal.
-//
-// TODO: also resolve references to string constants (e.g. via
-// pass.TypesInfo and go/constant, or a same-file AST scan of const decls).
 func stringLiteralValue(expr ast.Expr) (string, bool) {
 	lit, ok := expr.(*ast.BasicLit)
 	if !ok || lit.Kind != token.STRING {
@@ -124,4 +124,59 @@ func stringLiteralValue(expr ast.Expr) (string, bool) {
 		return "", false
 	}
 	return v, true
+}
+
+// packageConstants returns a map from constant name to its declared value
+// expression, scanned across every file in files. Constants are commonly
+// declared in a separate file (e.g. constants.go) from where they're used,
+// so this looks across the whole package rather than just one file.
+//
+// TODO: also handle a value built from string concatenation (a
+// *ast.BinaryExpr chain), not just a single literal.
+func packageConstants(files []*ast.File) map[string]ast.Expr {
+	consts := make(map[string]ast.Expr)
+	for _, file := range files {
+		for _, decl := range file.Decls {
+			gen, ok := decl.(*ast.GenDecl)
+			if !ok || gen.Tok != token.CONST {
+				continue
+			}
+			for _, spec := range gen.Specs {
+				vs, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				for i, name := range vs.Names {
+					if i < len(vs.Values) {
+						consts[name.Name] = vs.Values[i]
+					}
+				}
+			}
+		}
+	}
+	return consts
+}
+
+// resolveMessage returns the string value of expr, resolving a reference to
+// a package-level constant (via consts) if expr isn't itself a literal.
+//
+// TODO: resolve call.Fun via pass.TypesInfo.Uses to confirm an identifier
+// really refers to a constant in this package, not a shadowing local
+// variable with the same name.
+func resolveMessage(expr ast.Expr, consts map[string]ast.Expr) (string, bool) {
+	if v, ok := stringLiteralValue(expr); ok {
+		return v, true
+	}
+
+	id, ok := expr.(*ast.Ident)
+	if !ok {
+		return "", false
+	}
+
+	value, ok := consts[id.Name]
+	if !ok {
+		return "", false
+	}
+
+	return stringLiteralValue(value)
 }
