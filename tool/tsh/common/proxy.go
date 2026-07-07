@@ -97,81 +97,58 @@ func onProxyCommandSSH(cf *CLIConf, initFunc ClientInitFunc) error {
 	if !cf.Relogin {
 		return trace.Wrap(sshFunc())
 	}
-	// First instance takes the lock
-	// subsequent instances see that the lock is taken and wait for shared lock
-	//  - Happy path: First instance re-authenticates and releases lock. Subsequent instances acquire (immediately drop the lock) and execute.
-	//  - Unhappy path: Authentication fails. Subsequent instances time out waiting for the shared lock and fail early
-	//  - TODO: How do we prevent late arrivals from kicking off this whole party again? Once the exclusive lock is released, the next invokation will pop up another login window.
-	//          We need to somehow gate re-authentication attempts. Successful authentication needs to set/clear some state that we can observe here.
-	//     -
 
-	// Algorithm:
-	// Test existence of lockfile
-	//. - If exists, skip straight to acquire shared lock
-	//. - If not exists, try to access shared lock
-	//     - If successful, try re-athentication
+	return trace.Wrap(retryWithLimitedRelogin(cf.Context, tc, sshFunc))
+}
 
-	//   Try shared lock:
-	//.   - If not acquire after 5 seconds, fail
-	//.   - If acquired, continue with operation.
-	//
-
-	isRetry := false
-	var exclusiveUnlock func() error
-	wrappedSshFunc := func() error {
-		if isRetry {
-			logger.WarnContext(cf.Context, "Retry detected")
-			if exclusiveUnlock != nil {
-				// This is the second call of this closure. It only happens after re-authentication.
-				logger.WarnContext(cf.Context, "release exclusive lock. Login must have been successful.")
-				_ = exclusiveUnlock()
-			} else {
-				// We acquire and released the read lock but still failed.
-				logger.WarnContext(cf.Context, "Failed even after acquired shared lock. Giving up.")
-				return trace.Errorf("Must try manual login")
-			}
-		}
-		sshErr := sshFunc()
-		if !client.IsErrorResolvableWithRelogin(sshErr) {
-			return sshErr
-		}
-		if isRetry {
-			// This is our second attempt. Just return
-			return sshErr
-		}
-		isRetry = true
-		// RetryWithRelogin is about to attempt to login
-		// Start the critical section
-		var lockErr error
-		exclusiveUnlock, lockErr = utils.FSTryWriteLock("lockfile")
-
-		if lockErr != nil {
-			logger.WarnContext(cf.Context, "Failed to acquire exclusive lock. Will try a shared lock")
-			// Try the read lock?
-			if errors.Is(lockErr, utils.ErrUnsuccessfulLockTry) {
-				// Try read lock
-				sharedUnlock, err := utils.FSTryReadLockTimeout(cf.Context, "lockfile", 5*time.Second)
-				if err != nil {
-					logger.WarnContext(cf.Context, "could not acquire shared lock. Manual login required.")
-					return trace.Wrap(err, "could not acquire shared lock. Manual login required.")
-				}
-				logger.WarnContext(cf.Context, "Got the shared lock. Another process succeeded at logging in. Running command!")
-				// got the lock. Try to run
-				sharedUnlock()
-				return sshFunc()
-			}
-			// Some other error acquiring the write lock. Fail immediately
-			logger.WarnContext(cf.Context, "Something else went wrong acquiring exclusive lock. This is unexpected.")
-			return trace.Wrap(lockErr, "Failed to acquire exclusive lock. Manual login required.")
-		}
-		// We have the exclusive lock. Return while holding the lock. We'll release it upon
-		// re-entry to this closure. If we don't re-enter, then automatic re-login failed and the user must
-		// login manually. This manual login will clear the lock and restore our clean state.
-		return sshErr
-
+// retryWithLimitedRelogin is a bespoke implementation of 'RetryWithRelogin' that attempts to avoid
+// making excessive relogin attempts by gating relogin attempts behind a file lock.
+func retryWithLimitedRelogin(ctx context.Context, tc *client.TeleportClient, operation func() error) error {
+	opErr := operation()
+	var shouldRetry bool
+	if opErr, shouldRetry = libclient.ShouldRetryWithRelogin(ctx, tc, opErr); !shouldRetry {
+		return opErr
 	}
 
-	return trace.Wrap(libclient.RetryWithRelogin(cf.Context, tc, wrappedSshFunc))
+	exclusiveUnlock, lockErr := utils.FSTryWriteLock("lockfile")
+	if lockErr == nil {
+		defer func() {
+			if err := exclusiveUnlock(); err != nil {
+				// TODO: Log lock file location?
+				logger.WarnContext(ctx, "Failed to release relogin lock. Logging in manually will recover the lock.")
+			}
+		}()
+		// We got the exclusive lock, so we're responsible for attempting relogin.
+		reloginErr := libclient.Relogin(ctx, tc)
+		if reloginErr != nil {
+			return trace.Wrap(reloginErr)
+		}
+		// Success! Retry the operation now
+		exclusiveUnlock()
+		return operation()
+	}
+
+	if !errors.Is(lockErr, utils.ErrUnsuccessfulLockTry) {
+		logger.WarnContext(ctx, "Failed to acquire exclusive lock. Will try a shared lock")
+
+		// Some other error acquiring the write lock. Fail immediately
+		logger.WarnContext(ctx, "Something else went wrong acquiring exclusive lock. This is unexpected.")
+		return trace.Wrap(lockErr, "Failed to acquire exclusive lock. Manual login required.")
+	}
+
+	// Just contention. Grab the shared lock and wait for the exclusive lock
+	// holder to finish its relogin attempt.
+	sharedUnlock, err := utils.FSTryReadLockTimeout(ctx, "lockfile", 5*time.Second)
+	if err != nil {
+		// Either relogin took too long, or relogin failed.
+		logger.WarnContext(ctx, "could not acquire shared lock. Manual login required.")
+		return trace.Wrap(err, "could not acquire shared lock. Manual login required.")
+	}
+	logger.WarnContext(ctx, "Got the shared lock. Another process succeeded at logging in. Running command!")
+	// got the lock. Try to run
+	sharedUnlock()
+	return operation()
+
 }
 
 // cleanTargetHost cleans the targetHost and remote site and proxy suffixes.
