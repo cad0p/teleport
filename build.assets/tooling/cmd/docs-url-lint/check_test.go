@@ -50,9 +50,31 @@ func TestCheckTargets(t *testing.T) {
 		want    []Finding
 	}{
 		// TODO: add cases for:
-		// - two BadParameter calls without docs URLs in the same target function (expect two
-		//   findings, not one)
 		// - empty/nil targets against a source with a real violation (expect no findings)
+		{
+			// Mirrors the real onRequestSearch shape (two BadParameter calls in one
+			// function); confirms the walk collects every violation, not just the first.
+			name:    "two violations in the same target function",
+			pkgPath: "p",
+			srcs: []string{`package p
+
+import "github.com/gravitational/trace"
+
+func onExample() error {
+	if true {
+		return trace.BadParameter("only one of --kind and --roles may be specified")
+	}
+	return trace.BadParameter("one of --kind and --roles is required")
+}
+`},
+			targets: []Target{
+				{Package: "p", Function: "onExample"},
+			},
+			want: []Finding{
+				{Message: "trace.BadParameter call does not link to Teleport documentation"},
+				{Message: "trace.BadParameter call does not link to Teleport documentation"},
+			},
+		},
 		{
 			// Regression guard for the false positive hit scanning tool/tsh manually: a
 			// non-Teleport URL (git.go's real link to git-scm.com) must not be mistaken for a
