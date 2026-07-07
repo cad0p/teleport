@@ -259,6 +259,12 @@ func Run() error {
 		},
 	}
 
+	// Every case in this table only ever exercises trace.BadParameter, so a
+	// single shared constructor list covers all of them.
+	constructors := []Target{
+		{Package: "github.com/gravitational/trace", Function: "BadParameter"},
+	}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			fset := token.NewFileSet()
@@ -277,7 +283,7 @@ func Run() error {
 				Pkg:   types.NewPackage(tt.pkgPath, files[0].Name.Name),
 			}
 
-			got := checkTargets(pass, tt.targets)
+			got := checkTargets(pass, tt.targets, constructors)
 
 			if !slices.Equal(messages(got), messages(tt.want)) {
 				t.Errorf("checkTargets() = %v, want %v", messages(got), messages(tt.want))

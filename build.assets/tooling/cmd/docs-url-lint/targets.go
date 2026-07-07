@@ -32,3 +32,14 @@ func Targets() []Target {
 		},
 	}
 }
+
+// ErrorConstructors returns the error-constructing functions this linter
+// looks for within any in-scope function returned by Targets.
+func ErrorConstructors() []Target {
+	return []Target{
+		{
+			Package:  "github.com/gravitational/trace",
+			Function: "BadParameter",
+		},
+	}
+}

@@ -27,7 +27,7 @@ var Analyzer = &analysis.Analyzer{
 }
 
 func run(pass *analysis.Pass) (any, error) {
-	for _, f := range checkTargets(pass, Targets()) {
+	for _, f := range checkTargets(pass, Targets(), ErrorConstructors()) {
 		pass.Reportf(f.Pos, "%s", f.Message)
 	}
 	return nil, nil

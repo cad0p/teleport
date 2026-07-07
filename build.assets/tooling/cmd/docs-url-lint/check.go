@@ -17,6 +17,7 @@
 package main
 
 import (
+	"fmt"
 	"go/ast"
 	"go/token"
 	"strconv"
@@ -25,8 +26,9 @@ import (
 	"golang.org/x/tools/go/analysis"
 )
 
-// Finding describes a single trace.BadParameter call, within one of the
-// given targets, whose message doesn't reference Teleport documentation.
+// Finding describes a single call to a configured error constructor,
+// within one of the given targets, whose message doesn't reference
+// Teleport documentation.
 type Finding struct {
 	Pos     token.Pos
 	Message string
@@ -34,15 +36,16 @@ type Finding struct {
 
 const docsURLSubstring = "goteleport.com/docs"
 
-// checkTargets inspects pass for trace.BadParameter calls within the given
-// targets, returning a Finding for each one that doesn't reference Teleport
-// documentation.
-func checkTargets(pass *analysis.Pass, targets []Target) []Finding {
+// checkTargets inspects pass for calls to any of the given constructors,
+// within the given targets, returning a Finding for each one that doesn't
+// reference Teleport documentation.
+func checkTargets(pass *analysis.Pass, targets []Target, constructors []Target) []Finding {
 	relevant := targetFunctions(targets, pass.Pkg.Path())
 	if len(relevant) == 0 {
 		return nil
 	}
 
+	constructorNames := errorConstructorNames(constructors)
 	consts := packageConstants(pass.Files)
 
 	var findings []Finding
@@ -59,7 +62,7 @@ func checkTargets(pass *analysis.Pass, targets []Target) []Finding {
 					return true
 				}
 
-				msgArg, ok := badParameterMessageArg(call)
+				msgArg, calleeName, ok := errorMessageArg(call, constructorNames)
 				if !ok {
 					return true
 				}
@@ -75,7 +78,7 @@ func checkTargets(pass *analysis.Pass, targets []Target) []Finding {
 				if !strings.Contains(strings.ToLower(msg), docsURLSubstring) {
 					findings = append(findings, Finding{
 						Pos:     call.Pos(),
-						Message: "trace.BadParameter call does not link to Teleport documentation",
+						Message: fmt.Sprintf("%s call does not link to Teleport documentation", calleeName),
 					})
 				}
 
@@ -99,17 +102,39 @@ func targetFunctions(targets []Target, pkgPath string) map[string]bool {
 	return fns
 }
 
-// badParameterMessageArg returns the message argument of call, if call is a
-// trace.BadParameter call.
-//
-// TODO: resolve call.Fun via pass.TypesInfo.Uses to confirm this is really
-// gravitational/trace.BadParameter, not a same-named local function.
-func badParameterMessageArg(call *ast.CallExpr) (ast.Expr, bool) {
-	sel, ok := call.Fun.(*ast.SelectorExpr)
-	if !ok || sel.Sel.Name != "BadParameter" || len(call.Args) == 0 {
-		return nil, false
+// errorConstructorNames returns the set of function names from
+// constructors. The Package field isn't checked yet (see the TODO on
+// errorMessageArg), so constructors are currently matched by name alone.
+func errorConstructorNames(constructors []Target) map[string]bool {
+	names := make(map[string]bool)
+	for _, c := range constructors {
+		names[c.Function] = true
 	}
-	return call.Args[0], true
+	return names
+}
+
+// errorMessageArg returns the message argument of call and the call's
+// callee as written in source (e.g. "trace.BadParameter"), if call is a
+// selector call whose name is in constructorNames.
+//
+// TODO: resolve call.Fun via pass.TypesInfo.Uses to confirm this resolves to
+// the configured constructor's Package, not a same-named local function.
+func errorMessageArg(call *ast.CallExpr, constructorNames map[string]bool) (arg ast.Expr, calleeName string, ok bool) {
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || !constructorNames[sel.Sel.Name] || len(call.Args) == 0 {
+		return nil, "", false
+	}
+	return call.Args[0], selectorText(sel), true
+}
+
+// selectorText renders sel as written in source, e.g. "trace.BadParameter".
+// Falls back to just the method/function name if sel.X isn't a simple
+// package identifier (not expected for a package-qualified call like this).
+func selectorText(sel *ast.SelectorExpr) string {
+	if id, ok := sel.X.(*ast.Ident); ok {
+		return id.Name + "." + sel.Sel.Name
+	}
+	return sel.Sel.Name
 }
 
 // stringLiteralValue returns the string value of expr, if expr is a string
