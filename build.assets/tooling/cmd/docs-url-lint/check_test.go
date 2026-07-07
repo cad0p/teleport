@@ -50,10 +50,6 @@ func TestCheckTargets(t *testing.T) {
 		want    []Finding
 	}{
 		// TODO: add cases for:
-		// - docs URL split across a string concatenation (`"a" + "b" + url`), e.g. mirroring
-		//   tsh.go's mlockFailureMessage constant; stringLiteralValue only handles a single
-		//   *ast.BasicLit today, not a *ast.BinaryExpr chain, so this would need its own
-		//   resolution logic even after named-constant resolution is added
 		// - message containing a non-Teleport URL, e.g. https://git-scm.com/... (should still
 		//   report; regression guard for the false positive we hit scanning tool/tsh manually)
 		// - two BadParameter calls without docs URLs in the same target function (expect two

@@ -126,13 +126,34 @@ func stringLiteralValue(expr ast.Expr) (string, bool) {
 	return v, true
 }
 
+// resolveStringExpr returns the string value of expr, handling either a
+// plain string literal or a chain of literals joined by string
+// concatenation (e.g. "a" + "b" + "c", as in tsh.go's mlockFailureMessage).
+func resolveStringExpr(expr ast.Expr) (string, bool) {
+	if v, ok := stringLiteralValue(expr); ok {
+		return v, true
+	}
+
+	bin, ok := expr.(*ast.BinaryExpr)
+	if !ok || bin.Op != token.ADD {
+		return "", false
+	}
+
+	left, ok := resolveStringExpr(bin.X)
+	if !ok {
+		return "", false
+	}
+	right, ok := resolveStringExpr(bin.Y)
+	if !ok {
+		return "", false
+	}
+	return left + right, true
+}
+
 // packageConstants returns a map from constant name to its declared value
 // expression, scanned across every file in files. Constants are commonly
 // declared in a separate file (e.g. constants.go) from where they're used,
 // so this looks across the whole package rather than just one file.
-//
-// TODO: also handle a value built from string concatenation (a
-// *ast.BinaryExpr chain), not just a single literal.
 func packageConstants(files []*ast.File) map[string]ast.Expr {
 	consts := make(map[string]ast.Expr)
 	for _, file := range files {
@@ -164,7 +185,7 @@ func packageConstants(files []*ast.File) map[string]ast.Expr {
 // really refers to a constant in this package, not a shadowing local
 // variable with the same name.
 func resolveMessage(expr ast.Expr, consts map[string]ast.Expr) (string, bool) {
-	if v, ok := stringLiteralValue(expr); ok {
+	if v, ok := resolveStringExpr(expr); ok {
 		return v, true
 	}
 
@@ -178,5 +199,5 @@ func resolveMessage(expr ast.Expr, consts map[string]ast.Expr) (string, bool) {
 		return "", false
 	}
 
-	return stringLiteralValue(value)
+	return resolveStringExpr(value)
 }
