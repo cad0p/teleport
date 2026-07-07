@@ -50,11 +50,30 @@ func TestCheckTargets(t *testing.T) {
 		want    []Finding
 	}{
 		// TODO: add cases for:
-		// - message containing a non-Teleport URL, e.g. https://git-scm.com/... (should still
-		//   report; regression guard for the false positive we hit scanning tool/tsh manually)
 		// - two BadParameter calls without docs URLs in the same target function (expect two
 		//   findings, not one)
 		// - empty/nil targets against a source with a real violation (expect no findings)
+		{
+			// Regression guard for the false positive hit scanning tool/tsh manually: a
+			// non-Teleport URL (git.go's real link to git-scm.com) must not be mistaken for a
+			// Teleport docs link.
+			name:    "message with non-teleport url still reports",
+			pkgPath: "p",
+			srcs: []string{`package p
+
+import "github.com/gravitational/trace"
+
+func onExample() error {
+	return trace.BadParameter("could not locate the executable, install it by following the instructions at https://git-scm.com/book/en/v2/Getting-Started-Installing-Git")
+}
+`},
+			targets: []Target{
+				{Package: "p", Function: "onExample"},
+			},
+			want: []Finding{
+				{Message: "trace.BadParameter call does not link to Teleport documentation"},
+			},
+		},
 		{
 			name:    "bad parameter without docs url",
 			pkgPath: "p",
