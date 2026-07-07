@@ -49,6 +49,10 @@ func TestCheckTargets(t *testing.T) {
 		// - BadParameter call with no docs URL, but outside a target function (no findings)
 		// - BadParameter call with a docs URL via a named constant (no findings; needs either
 		//   real type-checking in the test harness, or a same-file AST scan for const decls)
+		// - docs URL split across a string concatenation (`"a" + "b" + url`), e.g. mirroring
+		//   tsh.go's mlockFailureMessage constant; stringLiteralValue only handles a single
+		//   *ast.BasicLit today, not a *ast.BinaryExpr chain, so this would need its own
+		//   resolution logic even after named-constant resolution is added
 		// - message containing a non-Teleport URL, e.g. https://git-scm.com/... (should still
 		//   report; regression guard for the false positive we hit scanning tool/tsh manually)
 		// - two BadParameter calls without docs URLs in the same target function (expect two
