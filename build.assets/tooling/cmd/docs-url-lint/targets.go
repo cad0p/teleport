@@ -27,8 +27,8 @@ type Target struct {
 func Targets() []Target {
 	return []Target{
 		{
-			Package:  "github.com/gravitational/teleport/tool/tsh/common",
-			Function: "onRequestSearch",
+			Package:  "github.com/gravitational/teleport/api/types",
+			Function: "checkMCPStdio",
 		},
 	}
 }
