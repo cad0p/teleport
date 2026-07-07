@@ -40,6 +40,7 @@ func messages(findings []Finding) []string {
 func TestCheckTargets(t *testing.T) {
 	tests := []struct {
 		name    string
+		pkgPath string
 		src     string
 		targets []Target
 		want    []Finding
@@ -49,8 +50,14 @@ func TestCheckTargets(t *testing.T) {
 		// - BadParameter call with no docs URL, but outside a target function (no findings)
 		// - BadParameter call with a docs URL via a named constant (no findings; needs either
 		//   real type-checking in the test harness, or a same-file AST scan for const decls)
+		// - message containing a non-Teleport URL, e.g. https://git-scm.com/... (should still
+		//   report; regression guard for the false positive we hit scanning tool/tsh manually)
+		// - two BadParameter calls without docs URLs in the same target function (expect two
+		//   findings, not one)
+		// - empty/nil targets against a source with a real violation (expect no findings)
 		{
-			name: "bad parameter without docs url",
+			name:    "bad parameter without docs url",
+			pkgPath: "p",
 			src: `package p
 
 import "github.com/gravitational/trace"
@@ -66,6 +73,26 @@ func onExample() error {
 				{Message: "trace.BadParameter call does not link to Teleport documentation"},
 			},
 		},
+		{
+			// Mirrors a real collision found in tool/tsh, tool/tctl, and tool/tbot: each has
+			// its own top-level Run function, and tool/tsh/common and tool/tctl/common even
+			// share the identical bare package name "common". A target for one package's Run
+			// must not pick up a same-named Run in a different package.
+			name:    "different package, same function name",
+			pkgPath: "github.com/gravitational/teleport/tool/tsh/common",
+			src: `package common
+
+import "github.com/gravitational/trace"
+
+func Run() error {
+	return trace.BadParameter("something went wrong")
+}
+`,
+			targets: []Target{
+				{Package: "github.com/gravitational/teleport/tool/tctl/common", Function: "Run"},
+			},
+			want: nil,
+		},
 	}
 
 	for _, tt := range tests {
@@ -79,7 +106,7 @@ func onExample() error {
 			pass := &analysis.Pass{
 				Fset:  fset,
 				Files: []*ast.File{f},
-				Pkg:   types.NewPackage("p", "p"),
+				Pkg:   types.NewPackage(tt.pkgPath, f.Name.Name),
 			}
 
 			got := checkTargets(pass, tt.targets)
