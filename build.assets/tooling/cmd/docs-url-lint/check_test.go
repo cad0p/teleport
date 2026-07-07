@@ -49,8 +49,22 @@ func TestCheckTargets(t *testing.T) {
 		targets []Target
 		want    []Finding
 	}{
-		// TODO: add cases for:
-		// - empty/nil targets against a source with a real violation (expect no findings)
+		{
+			// Confirms the analyzer fails closed: a real violation exists here, but with
+			// no targets given, nothing should be checked or reported.
+			name:    "empty targets against a real violation",
+			pkgPath: "p",
+			srcs: []string{`package p
+
+import "github.com/gravitational/trace"
+
+func onExample() error {
+	return trace.BadParameter("something went wrong")
+}
+`},
+			targets: nil,
+			want:    nil,
+		},
 		{
 			// Mirrors the real onRequestSearch shape (two BadParameter calls in one
 			// function); confirms the walk collects every violation, not just the first.
