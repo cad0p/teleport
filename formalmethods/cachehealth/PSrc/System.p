@@ -1,17 +1,17 @@
-event eReport: (who: machine, healthy: bool);
+event eReport: (who: machine, healthy: int);
 event eStop;
 event eDeregister: machine;
-event eSetHealth: bool;
+event eSetHealth: int;
 
 machine MetricBug {
-    var healthy: bool;
+    var healthy: int;
 
     start state Reporting {
         entry {
-            healthy = false;
+            healthy = 0;
         }
 
-        on eReport do (r: (who: machine, healthy: bool)) {
+        on eReport do (r: (who: machine, healthy: int)) {
             healthy = r.healthy;
             announce eMetricChanged, healthy;
         }
@@ -21,7 +21,7 @@ machine MetricBug {
 }
 
 machine Metric {
-    var health: map[machine, bool];
+    var health: map[machine, int];
 
     start state Init {
         entry {
@@ -30,7 +30,7 @@ machine Metric {
     }
 
     state Reporting {
-        on eReport do (r: (who: machine, healthy: bool)) {
+        on eReport do (r: (who: machine, healthy: int)) {
             health[r.who] = r.healthy;
             announce eMetricChanged, anyHealthy();
         }
@@ -41,24 +41,24 @@ machine Metric {
         }
     }
 
-    fun anyHealthy(): bool {
+    fun anyHealthy(): int {
         var k: machine;
 
         // If no cache is up, report healthy. This is a valid state and
         // alternative to deleting this metric.
         if (sizeof(health) == 0) {
-            return true;
+            return 1;
         }
 
         // If any cache is is healthy, report healthy status.
         foreach (k in keys(health)) {
-            if (health[k]) {
-                return true;
+            if (health[k] == 1) {
+                return 0;
             }
         }
 
         // If nothing is healthy, then report unhealthy.
-        return false;
+        return 0;
     }
 }
 
@@ -74,12 +74,12 @@ machine Cache {
 
     state Healthy {
         entry {
-            send metric, eReport, (who = this, healthy = true);
-            announce eCacheHealth, (who = this, healthy = true);
+            send metric, eReport, (who = this, healthy = 1);
+            announce eCacheHealth, (who = this, healthy = 1);
         }
 
-        on eSetHealth do (healthy: bool) {
-            if (!healthy) {
+        on eSetHealth do (healthy: int) {
+            if (healthy == 0) {
                 goto Unhealthy;
             }
         }
@@ -91,12 +91,12 @@ machine Cache {
 
     state Unhealthy {
         entry {
-            send metric, eReport, (who = this, healthy = false);
-            announce eCacheHealth, (who = this, healthy = false);
+            send metric, eReport, (who = this, healthy = 0);
+            announce eCacheHealth, (who = this, healthy = 0);
         }
 
-        on eSetHealth do (healthy: bool) {
-            if (healthy) {
+        on eSetHealth do (healthy: int) {
+            if (healthy == 1) {
                 goto Healthy;
             }
         }

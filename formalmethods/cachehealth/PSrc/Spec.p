@@ -1,13 +1,13 @@
 event eCacheDown: machine;
-event eCacheHealth: (who: machine, healthy: bool);
-event eMetricChanged: bool;
+event eCacheHealth: (who: machine, healthy: int);
+event eMetricChanged: int;
 
 spec MetricEventuallyConverges observes eCacheDown, eCacheHealth, eMetricChanged {
     // every cache currently up (any health)
     var up: set[machine];
     // the up caches reporting healthy
     var healthyUp: set[machine];
-    var metric: bool;
+    var metric: int;
 
     start cold state Init {
         entry {
@@ -16,9 +16,9 @@ spec MetricEventuallyConverges observes eCacheDown, eCacheHealth, eMetricChanged
     }
 
     cold state Converged {
-        on eCacheHealth do (r: (who: machine, healthy: bool)) {
+        on eCacheHealth do (r: (who: machine, healthy: int)) {
             up += (r.who);
-            if (r.healthy) {
+            if (r.healthy == 1) {
                 healthyUp += (r.who);
             } else {
                 healthyUp -= (r.who);
@@ -32,16 +32,16 @@ spec MetricEventuallyConverges observes eCacheDown, eCacheHealth, eMetricChanged
             check();
         }
 
-        on eMetricChanged do (h: bool) {
+        on eMetricChanged do (h: int) {
             metric = h;
             check();
         }
     }
 
     hot state Diverged {
-        on eCacheHealth do (r: (who: machine, healthy: bool)) {
+        on eCacheHealth do (r: (who: machine, healthy: int)) {
             up += (r.who);
-            if (r.healthy) {
+            if (r.healthy == 1) {
                 healthyUp += (r.who);
             } else {
                 healthyUp -= (r.who);
@@ -55,7 +55,7 @@ spec MetricEventuallyConverges observes eCacheDown, eCacheHealth, eMetricChanged
             check();
         }
 
-        on eMetricChanged do (h: bool) {
+        on eMetricChanged do (h: int) {
             metric = h;
             check();
         }
@@ -69,7 +69,11 @@ spec MetricEventuallyConverges observes eCacheDown, eCacheHealth, eMetricChanged
         }
     }
 
-    fun expected(): bool {
-        return sizeof(up) == 0 || sizeof(healthyUp) > 0;
+    fun expected(): int {
+        if (sizeof(up) == 0 || sizeof(healthyUp) > 0) {
+            return 1;
+        } else {
+            return 0;
+        }
     }
 }

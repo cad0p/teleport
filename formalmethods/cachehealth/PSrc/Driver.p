@@ -18,7 +18,7 @@ machine FaultInjector {
             if (failures == 0) {
                 goto Done;
             }
-            send cache, eSetHealth, $;
+            send cache, eSetHealth, choose(2);
             failures = failures - 1;
             send this, eInject;
         }
