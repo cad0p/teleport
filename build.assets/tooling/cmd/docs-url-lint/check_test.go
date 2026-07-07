@@ -46,7 +46,6 @@ func TestCheckTargets(t *testing.T) {
 		want    []Finding
 	}{
 		// TODO: add cases for:
-		// - BadParameter call with a docs URL in the message as a string literal (no findings)
 		// - BadParameter call with no docs URL, but outside a target function (no findings)
 		// - BadParameter call with a docs URL via a named constant (no findings; needs either
 		//   real type-checking in the test harness, or a same-file AST scan for const decls)
@@ -72,6 +71,22 @@ func onExample() error {
 			want: []Finding{
 				{Message: "trace.BadParameter call does not link to Teleport documentation"},
 			},
+		},
+		{
+			name:    "bad parameter with docs url",
+			pkgPath: "p",
+			src: `package p
+
+import "github.com/gravitational/trace"
+
+func onExample() error {
+	return trace.BadParameter("something went wrong, see https://goteleport.com/docs/reference/example/ for details")
+}
+`,
+			targets: []Target{
+				{Package: "p", Function: "onExample"},
+			},
+			want: nil,
 		},
 		{
 			// Mirrors a real collision found in tool/tsh, tool/tctl, and tool/tbot: each has
