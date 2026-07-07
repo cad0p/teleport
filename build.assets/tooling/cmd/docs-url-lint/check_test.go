@@ -20,10 +20,21 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"slices"
 	"testing"
 
 	"golang.org/x/tools/go/analysis"
 )
+
+// messages extracts the Message field from each Finding, so tests can
+// compare on message content without asserting on Pos.
+func messages(findings []Finding) []string {
+	msgs := make([]string, len(findings))
+	for i, f := range findings {
+		msgs[i] = f.Message
+	}
+	return msgs
+}
 
 func TestCheckTargets(t *testing.T) {
 	tests := []struct {
@@ -50,8 +61,9 @@ func TestCheckTargets(t *testing.T) {
 
 			got := checkTargets(pass, tt.targets)
 
-			// TODO: compare got to tt.want.
-			_ = got
+			if !slices.Equal(messages(got), messages(tt.want)) {
+				t.Errorf("checkTargets() = %v, want %v", messages(got), messages(tt.want))
+			}
 		})
 	}
 }
