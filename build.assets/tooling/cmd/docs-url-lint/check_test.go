@@ -50,8 +50,6 @@ func TestCheckTargets(t *testing.T) {
 		want    []Finding
 	}{
 		// TODO: add cases for:
-		// - BadParameter call with a docs URL via a named constant (no findings; needs either
-		//   real type-checking in the test harness, or a same-file AST scan for const decls)
 		// - docs URL split across a string concatenation (`"a" + "b" + url`), e.g. mirroring
 		//   tsh.go's mlockFailureMessage constant; stringLiteralValue only handles a single
 		//   *ast.BasicLit today, not a *ast.BinaryExpr chain, so this would need its own
@@ -61,8 +59,6 @@ func TestCheckTargets(t *testing.T) {
 		// - two BadParameter calls without docs URLs in the same target function (expect two
 		//   findings, not one)
 		// - empty/nil targets against a source with a real violation (expect no findings)
-		// - constant declared in a separate file from where it's used (exercises the
-		//   multi-file resolution added to this harness)
 		{
 			name:    "bad parameter without docs url",
 			pkgPath: "p",
@@ -119,6 +115,31 @@ func onExample() error {
 			want: []Finding{
 				{Message: "trace.BadParameter call does not link to Teleport documentation"},
 			},
+		},
+		{
+			// Mirrors Teleport's constants.go convention: the constant lives in one file
+			// (srcs[0]) and is referenced from another (srcs[1]). Exercises both named-constant
+			// resolution and the multi-file lookup added to this harness in one case.
+			name:    "bad parameter with named constant with docs url in a separate file",
+			pkgPath: "p",
+			srcs: []string{
+				`package p
+
+const helpfulMessage = "something went wrong, see https://goteleport.com/docs/reference/example/ for details"
+`,
+				`package p
+
+import "github.com/gravitational/trace"
+
+func onExample() error {
+	return trace.BadParameter(helpfulMessage)
+}
+`,
+			},
+			targets: []Target{
+				{Package: "p", Function: "onExample"},
+			},
+			want: nil,
 		},
 		{
 			name:    "violation outside target function",
