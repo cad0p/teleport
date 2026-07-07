@@ -25,5 +25,10 @@ type Target struct {
 
 // Targets returns the packages and functions this linter checks.
 func Targets() []Target {
-	return nil
+	return []Target{
+		{
+			Package:  "github.com/gravitational/teleport/tool/tsh/common",
+			Function: "onRequestSearch",
+		},
+	}
 }
