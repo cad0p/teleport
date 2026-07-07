@@ -4,7 +4,7 @@ go 1.26.4
 
 tool (
 	github.com/gravitational/teleport/build.assets/tooling/cmd/helm-janitor
-	github.com/gravitational/teleport/build.assets/tooling/cmd/protoopaque-retag
+	github.com/gravitational/teleport/build.assets/tooling/cmd/protoc-gen-go-protoopaque-retag
 )
 
 require (

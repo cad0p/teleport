@@ -1,8 +1,5 @@
 version: v2
 
-# inputs and options should be replicated to buf-go-retag.gen.yaml (as that one
-# must run after protoc-gen-go)
-
 inputs:
   - directory: .
     exclude_paths:
@@ -26,9 +23,9 @@ inputs:
 
 plugins:
   - local:
-      - go
-      - run
-      - google.golang.org/protobuf/cmd/protoc-gen-go
+      - sh
+      - -c
+      - 'exec "$( GOWORK=off go -C ./build.assets/tooling tool -n github.com/gravitational/teleport/build.assets/tooling/cmd/protoc-gen-go-protoopaque-retag )"'
     out: .
     opt:
       - module=github.com/gravitational/teleport
