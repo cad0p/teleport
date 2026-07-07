@@ -121,8 +121,7 @@ export function isLLM(app: App): boolean {
  */
 export function isTcp(app: App): boolean {
   return (
-    app.endpointUri.startsWith('tcp://') ||
-    app.endpointUri.startsWith('tls://')
+    app.endpointUri.startsWith('tcp://') || app.endpointUri.startsWith('tls://')
   );
 }
 
