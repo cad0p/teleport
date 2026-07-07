@@ -23,6 +23,7 @@ import (
 	"crypto"
 	"crypto/tls"
 	"crypto/x509/pkix"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -30,6 +31,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	template "github.com/DataDog/datadog-agent/pkg/template/text"
@@ -40,6 +42,7 @@ import (
 	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/teleport/api/types"
 	apiutils "github.com/gravitational/teleport/api/utils"
+	"github.com/gravitational/teleport/lib/client"
 	libclient "github.com/gravitational/teleport/lib/client"
 	"github.com/gravitational/teleport/lib/client/db/dbcmd"
 	"github.com/gravitational/teleport/lib/defaults"
@@ -94,8 +97,81 @@ func onProxyCommandSSH(cf *CLIConf, initFunc ClientInitFunc) error {
 	if !cf.Relogin {
 		return trace.Wrap(sshFunc())
 	}
+	// First instance takes the lock
+	// subsequent instances see that the lock is taken and wait for shared lock
+	//  - Happy path: First instance re-authenticates and releases lock. Subsequent instances acquire (immediately drop the lock) and execute.
+	//  - Unhappy path: Authentication fails. Subsequent instances time out waiting for the shared lock and fail early
+	//  - TODO: How do we prevent late arrivals from kicking off this whole party again? Once the exclusive lock is released, the next invokation will pop up another login window.
+	//          We need to somehow gate re-authentication attempts. Successful authentication needs to set/clear some state that we can observe here.
+	//     -
 
-	return trace.Wrap(libclient.RetryWithRelogin(cf.Context, tc, sshFunc))
+	// Algorithm:
+	// Test existence of lockfile
+	//. - If exists, skip straight to acquire shared lock
+	//. - If not exists, try to access shared lock
+	//     - If successful, try re-athentication
+
+	//   Try shared lock:
+	//.   - If not acquire after 5 seconds, fail
+	//.   - If acquired, continue with operation.
+	//
+
+	isRetry := false
+	var exclusiveUnlock func() error
+	wrappedSshFunc := func() error {
+		if isRetry {
+			logger.WarnContext(cf.Context, "Retry detected")
+			if exclusiveUnlock != nil {
+				// This is the second call of this closure. It only happens after re-authentication.
+				logger.WarnContext(cf.Context, "release exclusive lock. Login must have been successful.")
+				_ = exclusiveUnlock()
+			} else {
+				// We acquire and released the read lock but still failed.
+				logger.WarnContext(cf.Context, "Failed even after acquired shared lock. Giving up.")
+				return trace.Errorf("Must try manual login")
+			}
+		}
+		sshErr := sshFunc()
+		if !client.IsErrorResolvableWithRelogin(sshErr) {
+			return sshErr
+		}
+		if isRetry {
+			// This is our second attempt. Just return
+			return sshErr
+		}
+		isRetry = true
+		// RetryWithRelogin is about to attempt to login
+		// Start the critical section
+		var lockErr error
+		exclusiveUnlock, lockErr = utils.FSTryWriteLock("lockfile")
+
+		if lockErr != nil {
+			logger.WarnContext(cf.Context, "Failed to acquire exclusive lock. Will try a shared lock")
+			// Try the read lock?
+			if errors.Is(lockErr, utils.ErrUnsuccessfulLockTry) {
+				// Try read lock
+				sharedUnlock, err := utils.FSTryReadLockTimeout(cf.Context, "lockfile", 5*time.Second)
+				if err != nil {
+					logger.WarnContext(cf.Context, "could not acquire shared lock. Manual login required.")
+					return trace.Wrap(err, "could not acquire shared lock. Manual login required.")
+				}
+				logger.WarnContext(cf.Context, "Got the shared lock. Another process succeeded at logging in. Running command!")
+				// got the lock. Try to run
+				sharedUnlock()
+				return sshFunc()
+			}
+			// Some other error acquiring the write lock. Fail immediately
+			logger.WarnContext(cf.Context, "Something else went wrong acquiring exclusive lock. This is unexpected.")
+			return trace.Wrap(lockErr, "Failed to acquire exclusive lock. Manual login required.")
+		}
+		// We have the exclusive lock. Return while holding the lock. We'll release it upon
+		// re-entry to this closure. If we don't re-enter, then automatic re-login failed and the user must
+		// login manually. This manual login will clear the lock and restore our clean state.
+		return sshErr
+
+	}
+
+	return trace.Wrap(libclient.RetryWithRelogin(cf.Context, tc, wrappedSshFunc))
 }
 
 // cleanTargetHost cleans the targetHost and remote site and proxy suffixes.
