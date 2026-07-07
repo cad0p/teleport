@@ -682,70 +682,11 @@ func VirtualPathEnvNames(kind VirtualPathKind, params VirtualPathParams) []strin
 	return vars
 }
 
-// RetryWithRelogin is a helper error handling method, attempts to relogin and
-// retry the function once.
-func RetryWithRelogin(ctx context.Context, tc *TeleportClient, fn func() error, opts ...RetryWithReloginOption) error {
-	fnErr := fn()
-	switch {
-	case fnErr == nil:
-		return nil
-	case utils.IsPredicateError(fnErr):
-		return trace.Wrap(utils.PredicateError{Err: fnErr})
-	case tc.NonInteractive:
-		return trace.Wrap(fnErr, "cannot relogin in non-interactive session")
-	case !IsErrorResolvableWithRelogin(fnErr):
-		// If the connection to Auth was unexpectedly cut, see if the client is too
-		// old to interact with the cluster.
-		if errors.Is(fnErr, io.EOF) || (trace.IsConnectionProblem(fnErr) && strings.Contains(fnErr.Error(), "error reading from server: EOF")) {
-			// The results are intentionally ignored - Ping prints warnings
-			// related to versions, and that's all that is needed here.
-			_, _ = tc.Ping(ctx)
-		}
-
-		return trace.Wrap(fnErr)
-	}
-
-	// Try to get the exclusive lock:
-	//  - if successful, proceed with login, _then_ run the operation
-	//  - if not, wait for read lock. Skip login and run operation
-	//unlock, err := utils.FSTryWriteLock("thelock")
-	//if err != nil {
-	//	if !errors.Is(err, utils.ErrUnsuccessfulLockTry) {
-	//		return trace.Wrap(err, "failed to get login exclusive lock")
-	//	}
-	//
-	//	// Otherwise, we want the shared lock instead.
-	//	// Once it is available, we'll know we have a fresh login.
-	//	// TODO: Acquiring the shared lock means that the instance handling
-	//	// login has exited, but we don't know if it succeeded.
-	//	unlock, err = utils.FSTryReadLockTimeout(ctx, "thelock", 5*time.Second)
-	//	if err == nil {
-	//		// Got the read lock. Unlock immediately because we don't need it.
-	//		// We just wanted to wait for the previous process or thread to finish logging in.
-	//		unlock()
-	//		return fn()
-	//	}
-	//	return trace.Wrap(err, "error waiting for login shared lock")
-	//}
-	//// The "winner" holds the write lock
-	//defer unlock()
-
-	// Determined that error is resolvable with relogin.
+// Relogin attempts to relogin as a recovery from the given fnErr
+func Relogin(ctx context.Context, tc *TeleportClient, opts ...RetryWithReloginOption) error {
 	opt := defaultRetryWithReloginOptions()
 	for _, o := range opts {
 		o(opt)
-	}
-	log.DebugContext(ctx, "Activating relogin on error", "error", fnErr, "error_type", logutils.TypeAttr(trace.Unwrap(fnErr)))
-
-	if keys.IsPrivateKeyPolicyError(fnErr) {
-		privateKeyPolicy, err := keys.ParsePrivateKeyPolicyError(fnErr)
-		if err != nil {
-			return trace.Wrap(err)
-		}
-
-		if err := tc.updatePrivateKeyPolicy(privateKeyPolicy); err != nil {
-			return trace.Wrap(err)
-		}
 	}
 
 	if opt.beforeLoginHook != nil {
@@ -757,7 +698,6 @@ func RetryWithRelogin(ctx context.Context, tc *TeleportClient, fn func() error, 
 	if err != nil {
 		if errors.Is(err, prompt.ErrNotTerminal) {
 			log.DebugContext(ctx, "Relogin is not available in this environment", "error", err)
-			return trace.Wrap(fnErr)
 		}
 		if trace.IsTrustError(err) {
 			return trace.Wrap(err, "refusing to connect to untrusted proxy %v without --insecure flag\n", tc.SSHProxyAddr)
@@ -790,10 +730,60 @@ func RetryWithRelogin(ctx context.Context, tc *TeleportClient, fn func() error, 
 			return trace.Wrap(err)
 		}
 	}
+	return nil
+}
 
-	// fn() may block indefinitely, so we want to ensure we
-	// release the exclusive lock on the lockfile.
-	//unlock()
+// ShouldRetryWithRelogin determines if the error should be retried. It applies more scrutiny than
+// 'IsErrorResolvableWithRelogin' by checking if the client is non-interactive or if a predicate error occurred.
+// Returns the original error (possibly wrapped with additional context) and a boolean indicating whether or not
+// relogin should be attempted.
+func ShouldRetryWithRelogin(ctx context.Context, tc *TeleportClient, fnErr error) (error, bool) {
+	if keys.IsPrivateKeyPolicyError(fnErr) {
+		privateKeyPolicy, err := keys.ParsePrivateKeyPolicyError(fnErr)
+		if err != nil {
+			return trace.Wrap(err), false
+		}
+
+		tc.updatePrivateKeyPolicy(privateKeyPolicy)
+	}
+
+	switch {
+	case utils.IsPredicateError(fnErr):
+		return trace.Wrap(utils.PredicateError{Err: fnErr}), false
+	case tc.NonInteractive:
+		return trace.Wrap(fnErr, "cannot relogin in non-interactive session"), false
+	case !IsErrorResolvableWithRelogin(fnErr):
+		// If the connection to Auth was unexpectedly cut, see if the client is too
+		// old to interact with the cluster.
+		if errors.Is(fnErr, io.EOF) || (trace.IsConnectionProblem(fnErr) && strings.Contains(fnErr.Error(), "error reading from server: EOF")) {
+			// The results are intentionally ignored - Ping prints warnings
+			// related to versions, and that's all that is needed here.
+			_, _ = tc.Ping(ctx)
+		}
+
+		return trace.Wrap(fnErr), false
+	}
+	return fnErr, true
+}
+
+// RetryWithRelogin is a helper error handling method, attempts to relogin and
+// retry the function once.
+func RetryWithRelogin(ctx context.Context, tc *TeleportClient, fn func() error, opts ...RetryWithReloginOption) error {
+	fnErr := fn()
+	var shouldRetry bool
+	if fnErr, shouldRetry = ShouldRetryWithRelogin(ctx, tc, fnErr); !shouldRetry {
+		return fnErr
+	}
+
+	log.DebugContext(ctx, "Activating relogin on error", "error", fnErr, "error_type", logutils.TypeAttr(trace.Unwrap(fnErr)))
+	err := Relogin(ctx, tc, opts...)
+	if err != nil {
+		if errors.Is(err, prompt.ErrNotTerminal) {
+			return trace.Wrap(fnErr)
+		}
+		return trace.Wrap(err)
+	}
+
 	return fn()
 }
 
@@ -4115,9 +4105,7 @@ func (tc *TeleportClient) loginWithHardwareKeyRetry(ctx context.Context, login f
 				return nil, trace.Wrap(err)
 			}
 
-			if err := tc.updatePrivateKeyPolicy(privateKeyPolicy); err != nil {
-				return nil, trace.Wrap(err)
-			}
+			tc.updatePrivateKeyPolicy(privateKeyPolicy)
 
 			fmt.Fprintf(tc.Stderr, "Relogging in with hardware-backed private key.\n")
 			keyRing, err = tc.GetNewLoginKeyRing(ctx)
@@ -4132,13 +4120,12 @@ func (tc *TeleportClient) loginWithHardwareKeyRetry(ctx context.Context, login f
 	return keyRing, trace.Wrap(loginErr)
 }
 
-func (tc *TeleportClient) updatePrivateKeyPolicy(policy keys.PrivateKeyPolicy) error {
+func (tc *TeleportClient) updatePrivateKeyPolicy(policy keys.PrivateKeyPolicy) {
 	// The current private key was rejected due to an unmet key policy requirement.
 	fmt.Fprintf(tc.Stderr, "Unmet private key policy %q.\n", policy)
 
 	// Set the private key policy to the expected value and re-login.
 	tc.PrivateKeyPolicy = policy
-	return nil
 }
 
 // GetNewLoginKeyRing gets a KeyRing with new private keys for login.
