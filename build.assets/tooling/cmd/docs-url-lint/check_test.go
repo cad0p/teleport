@@ -92,6 +92,29 @@ func onExample() error {
 			want: nil,
 		},
 		{
+			// Currently fails: stringLiteralValue only resolves *ast.BasicLit, so a message
+			// passed via a named constant is treated as "can't verify" and silently skipped.
+			// This should report a finding once constant resolution is implemented.
+			name:    "bad parameter with named constant missing docs url",
+			pkgPath: "p",
+			src: `package p
+
+import "github.com/gravitational/trace"
+
+const noLinkMessage = "something went wrong"
+
+func onExample() error {
+	return trace.BadParameter(noLinkMessage)
+}
+`,
+			targets: []Target{
+				{Package: "p", Function: "onExample"},
+			},
+			want: []Finding{
+				{Message: "trace.BadParameter call does not link to Teleport documentation"},
+			},
+		},
+		{
 			name:    "violation outside target function",
 			pkgPath: "p",
 			src: `package p
