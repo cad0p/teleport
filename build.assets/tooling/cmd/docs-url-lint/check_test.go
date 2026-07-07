@@ -20,6 +20,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"slices"
 	"testing"
 
@@ -43,7 +44,23 @@ func TestCheckTargets(t *testing.T) {
 		targets []Target
 		want    []Finding
 	}{
-		// TODO: add cases.
+		{
+			name: "bad parameter without docs url",
+			src: `package p
+
+import "github.com/gravitational/trace"
+
+func onExample() error {
+	return trace.BadParameter("something went wrong")
+}
+`,
+			targets: []Target{
+				{Package: "p", Function: "onExample"},
+			},
+			want: []Finding{
+				{Message: "trace.BadParameter call does not link to Teleport documentation"},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -57,6 +74,7 @@ func TestCheckTargets(t *testing.T) {
 			pass := &analysis.Pass{
 				Fset:  fset,
 				Files: []*ast.File{f},
+				Pkg:   types.NewPackage("p", "p"),
 			}
 
 			got := checkTargets(pass, tt.targets)
