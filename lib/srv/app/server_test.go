@@ -366,9 +366,10 @@ func SetUpSuiteWithConfig(t *testing.T, config suiteConfig) *Suite {
 	})
 	require.NoError(t, err)
 	authorizer, err := authz.NewScopedAuthorizer(authz.AuthorizerOpts{
-		ClusterName: "cluster-name",
-		AccessPoint: s.authClient,
-		LockWatcher: s.lockWatcher,
+		ClusterName:      "cluster-name",
+		AccessPoint:      s.authClient,
+		ScopedRoleReader: s.authClient.ScopedRoleReader(),
+		LockWatcher:      s.lockWatcher,
 	})
 	require.NoError(t, err)
 
