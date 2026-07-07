@@ -44,6 +44,11 @@ func TestCheckTargets(t *testing.T) {
 		targets []Target
 		want    []Finding
 	}{
+		// TODO: add cases for:
+		// - BadParameter call with a docs URL in the message as a string literal (no findings)
+		// - BadParameter call with no docs URL, but outside a target function (no findings)
+		// - BadParameter call with a docs URL via a named constant (no findings; needs either
+		//   real type-checking in the test harness, or a same-file AST scan for const decls)
 		{
 			name: "bad parameter without docs url",
 			src: `package p
