@@ -834,7 +834,11 @@ func isNetworkError(err error) bool {
 }
 
 func (c *kubeCredentialsCommand) checkLocalProxyRequirement(profile *profile.Profile) error {
-	if profile.RequireKubeLocalProxy() {
+	// A hardware-key policy can't be served through the exec-plugin credentials
+	// path: the key is non-exportable, so SoftwarePrivateKeyPEM below would fail
+	// with an opaque "cannot get software key PEM". Return an actionable error
+	// pointing the user at the local-proxy commands instead.
+	if profile.RequireKubeLocalProxy() || profile.PrivateKeyPolicy.IsHardwareKeyPolicy() {
 		return trace.BadParameter("Cannot connect Kubernetes clients to Teleport Proxy directly. Please use `tsh proxy kube` or `tsh kubectl` instead.")
 	}
 	return nil
