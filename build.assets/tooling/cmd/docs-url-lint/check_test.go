@@ -17,6 +17,7 @@
 package main
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -41,7 +42,10 @@ func TestCheckTargets(t *testing.T) {
 	tests := []struct {
 		name    string
 		pkgPath string
-		src     string
+		// srcs holds the contents of one or more synthetic files in the
+		// same package, so tests can exercise cross-file resolution (e.g. a
+		// constant declared in a separate constants.go-style file).
+		srcs    []string
 		targets []Target
 		want    []Finding
 	}{
@@ -57,17 +61,19 @@ func TestCheckTargets(t *testing.T) {
 		// - two BadParameter calls without docs URLs in the same target function (expect two
 		//   findings, not one)
 		// - empty/nil targets against a source with a real violation (expect no findings)
+		// - constant declared in a separate file from where it's used (exercises the
+		//   multi-file resolution added to this harness)
 		{
 			name:    "bad parameter without docs url",
 			pkgPath: "p",
-			src: `package p
+			srcs: []string{`package p
 
 import "github.com/gravitational/trace"
 
 func onExample() error {
 	return trace.BadParameter("something went wrong")
 }
-`,
+`},
 			targets: []Target{
 				{Package: "p", Function: "onExample"},
 			},
@@ -78,14 +84,14 @@ func onExample() error {
 		{
 			name:    "bad parameter with docs url",
 			pkgPath: "p",
-			src: `package p
+			srcs: []string{`package p
 
 import "github.com/gravitational/trace"
 
 func onExample() error {
 	return trace.BadParameter("something went wrong, see https://goteleport.com/docs/reference/example/ for details")
 }
-`,
+`},
 			targets: []Target{
 				{Package: "p", Function: "onExample"},
 			},
@@ -97,7 +103,7 @@ func onExample() error {
 			// This should report a finding once constant resolution is implemented.
 			name:    "bad parameter with named constant missing docs url",
 			pkgPath: "p",
-			src: `package p
+			srcs: []string{`package p
 
 import "github.com/gravitational/trace"
 
@@ -106,7 +112,7 @@ const noLinkMessage = "something went wrong"
 func onExample() error {
 	return trace.BadParameter(noLinkMessage)
 }
-`,
+`},
 			targets: []Target{
 				{Package: "p", Function: "onExample"},
 			},
@@ -117,7 +123,7 @@ func onExample() error {
 		{
 			name:    "violation outside target function",
 			pkgPath: "p",
-			src: `package p
+			srcs: []string{`package p
 
 import "github.com/gravitational/trace"
 
@@ -128,7 +134,7 @@ func onExample() error {
 func notATarget() error {
 	return trace.BadParameter("something went wrong")
 }
-`,
+`},
 			targets: []Target{
 				{Package: "p", Function: "onExample"},
 			},
@@ -141,14 +147,14 @@ func notATarget() error {
 			// must not pick up a same-named Run in a different package.
 			name:    "different package, same function name",
 			pkgPath: "github.com/gravitational/teleport/tool/tsh/common",
-			src: `package common
+			srcs: []string{`package common
 
 import "github.com/gravitational/trace"
 
 func Run() error {
 	return trace.BadParameter("something went wrong")
 }
-`,
+`},
 			targets: []Target{
 				{Package: "github.com/gravitational/teleport/tool/tctl/common", Function: "Run"},
 			},
@@ -159,15 +165,19 @@ func Run() error {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			fset := token.NewFileSet()
-			f, err := parser.ParseFile(fset, "test.go", tt.src, 0)
-			if err != nil {
-				t.Fatalf("parsing source: %v", err)
+			var files []*ast.File
+			for i, src := range tt.srcs {
+				f, err := parser.ParseFile(fset, fmt.Sprintf("file%d.go", i), src, 0)
+				if err != nil {
+					t.Fatalf("parsing source %d: %v", i, err)
+				}
+				files = append(files, f)
 			}
 
 			pass := &analysis.Pass{
 				Fset:  fset,
-				Files: []*ast.File{f},
-				Pkg:   types.NewPackage(tt.pkgPath, f.Name.Name),
+				Files: files,
+				Pkg:   types.NewPackage(tt.pkgPath, files[0].Name.Name),
 			}
 
 			got := checkTargets(pass, tt.targets)
