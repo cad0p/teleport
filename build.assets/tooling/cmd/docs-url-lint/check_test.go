@@ -142,6 +142,31 @@ func onExample() error {
 			want: nil,
 		},
 		{
+			// Currently fails: a constant's value built from string concatenation is an
+			// *ast.BinaryExpr, and neither stringLiteralValue nor resolveMessage's constant
+			// lookup handles anything but a single literal. Mirrors tsh.go's
+			// mlockFailureMessage, which is built the same way via `+`.
+			name:    "bad parameter with concatenated constant missing docs url",
+			pkgPath: "p",
+			srcs: []string{`package p
+
+import "github.com/gravitational/trace"
+
+const noLinkMessage = "something went wrong. " +
+	"please check your configuration."
+
+func onExample() error {
+	return trace.BadParameter(noLinkMessage)
+}
+`},
+			targets: []Target{
+				{Package: "p", Function: "onExample"},
+			},
+			want: []Finding{
+				{Message: "trace.BadParameter call does not link to Teleport documentation"},
+			},
+		},
+		{
 			name:    "violation outside target function",
 			pkgPath: "p",
 			srcs: []string{`package p
