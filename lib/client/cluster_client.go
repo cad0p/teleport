@@ -273,6 +273,16 @@ func (c *ClusterClient) generateUserCerts(ctx context.Context, cachePolicy CertC
 // provided target for the provided user. If per session MFA is required to establish the
 // connection, then the MFA ceremony will be performed.
 func (c *ClusterClient) SessionSSHConfig(ctx context.Context, user string, target NodeDetails) (*ssh.ClientConfig, error) {
+	cfg, _, err := c.SessionSSHConfigAndKeyRing(ctx, user, target)
+	return cfg, trace.Wrap(err)
+}
+
+// SessionSSHConfigAndKeyRing is like [SessionSSHConfig] but also returns the key ring the
+// config was built from. When per-session MFA is required, the returned key ring holds the
+// single-use certificate issued by the MFA ceremony. Callers that need the Proxy Service to
+// authenticate to the target on their behalf (the forwarding node uses the SSH agent
+// forwarded by the client) must forward that certificate, so they need the key ring.
+func (c *ClusterClient) SessionSSHConfigAndKeyRing(ctx context.Context, user string, target NodeDetails) (*ssh.ClientConfig, *KeyRing, error) {
 	ctx, span := c.Tracer.Start(
 		ctx,
 		"clusterClient/SessionSSHConfig",
@@ -286,26 +296,26 @@ func (c *ClusterClient) SessionSSHConfig(ctx context.Context, user string, targe
 	sshConfig := c.ProxyClient.SSHConfig(user)
 
 	if target.MFACheck != nil && !target.MFACheck.Required {
-		return sshConfig, nil
+		return sshConfig, nil, nil
 	}
 
 	newKeyRing, completedMFA, err := c.SessionSSHKeyRing(ctx, user, target)
 	if err != nil {
-		return nil, trace.Wrap(err)
+		return nil, nil, trace.Wrap(err)
 	}
 	if !completedMFA {
 		// The caller relies on this function returning an error if
 		// target.MFACheck is nil and session MFA was not actually required.
-		return nil, trace.Wrap(services.ErrSessionMFANotRequired)
+		return nil, nil, trace.Wrap(services.ErrSessionMFANotRequired)
 	}
 
 	am, err := newKeyRing.AsAuthMethod()
 	if err != nil {
-		return nil, trace.Wrap(ceremonyFailedErr{err})
+		return nil, nil, trace.Wrap(ceremonyFailedErr{err})
 	}
 
 	sshConfig.Auth = []ssh.AuthMethod{am}
-	return sshConfig, nil
+	return sshConfig, newKeyRing, nil
 }
 
 // SessionSSHKeyRing returns a KeyRing valid for an SSH session to the target.

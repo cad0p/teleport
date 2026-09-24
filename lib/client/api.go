@@ -2182,6 +2182,25 @@ func (m *MFARequiredUnknownError) Unwrap() error {
 	return m.err
 }
 
+// newMFAKeyRingAgent returns a dedicated in-memory SSH agent that serves the
+// single-use certificate held by the provided key ring. It is used to forward
+// the MFA-verified certificate to the Proxy Service, whose forwarding node
+// authenticates to the target node with the client's SSH agent.
+func newMFAKeyRingAgent(keyRing *KeyRing) (agent.ExtendedAgent, error) {
+	agentKey, err := keyRing.AsAgentKey()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	mfaAgent, ok := agent.NewKeyring().(agent.ExtendedAgent)
+	if !ok {
+		return nil, trace.BadParameter("in-memory SSH agent does not implement agent.ExtendedAgent")
+	}
+	if err := mfaAgent.Add(agentKey); err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return mfaAgent, nil
+}
+
 // connectToNodeWithMFA checks if per session mfa is required to connect to the target host, and
 // if it is required, then the mfa ceremony is attempted. The target host is dialed once the ceremony
 // completes and new certificates are retrieved.
@@ -2211,12 +2230,22 @@ func (tc *TeleportClient) connectToNodeWithMFA(ctx context.Context, clt *Cluster
 	}
 
 	// per-session mfa is required, perform the mfa ceremony
-	cfg, err := clt.SessionSSHConfig(ctx, user, nodeDetails)
+	cfg, mfaKeyRing, err := clt.SessionSSHConfigAndKeyRing(ctx, user, nodeDetails)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	conn, details, err := clt.DialHostWithResumption(ctx, nodeDetails.Addr, nodeDetails.Cluster, tc.localAgent.ExtendedAgent)
+	// The Proxy Service's forwarding node authenticates to the target node with
+	// the SSH agent forwarded by the client, so the single-use, MFA-verified
+	// certificate has to be served through that agent. Load it into a dedicated
+	// in-memory agent; the base key ring on the local agent is the login
+	// certificate, which the node rejects for per-session MFA roles.
+	mfaAgent, err := newMFAKeyRingAgent(mfaKeyRing)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	conn, details, err := clt.DialHostWithResumption(ctx, nodeDetails.Addr, nodeDetails.Cluster, mfaAgent)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
