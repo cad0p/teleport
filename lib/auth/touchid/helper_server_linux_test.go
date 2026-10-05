@@ -104,6 +104,48 @@ func TestHelperRegisterFindDelete(t *testing.T) {
 	require.Empty(t, creds)
 }
 
+// TestPasswordlessDiscovery pins the prerequisite of passwordless login on
+// Linux. tsh decides whether to skip the password prompt via
+// client.canDefaultToPasswordless -> touchid.HasCredentials ->
+// native.FindCredentials(rpID, "") -- an username-less lookup, as the case
+// must be discoverable from the rpID alone. This mirrors macOS, where the
+// same call enumerates the Secure Enclave keychain.
+func TestPasswordlessDiscovery(t *testing.T) {
+	h, calls := startTestHelper(t)
+
+	tidAlice, err := h.Register("teleport.example.com", "alice", []byte("alice-handle"))
+	require.NoError(t, err)
+	tidBob, err := h.Register("teleport.example.com", "bob", []byte("bob-handle"))
+	require.NoError(t, err)
+	// A credential for another rpID must never be returned.
+	_, err = h.Register("other.example.com", "carol", []byte("carol-handle"))
+	require.NoError(t, err)
+
+	// Username-less discovery (the passwordless call) returns every credential
+	// for the rpID, with the user handle that resolves the Teleport user.
+	creds, err := h.FindCredentials("teleport.example.com", "")
+	require.NoError(t, err)
+	require.Len(t, creds, 2)
+	got := map[string]string{}
+	for _, c := range creds {
+		got[c.User.Name] = string(c.User.UserHandle)
+	}
+	assert.Equal(t, map[string]string{
+		"alice": "alice-handle",
+		"bob":   "bob-handle",
+	}, got)
+	assert.Equal(t, int32(0), atomic.LoadInt32(calls), "discovery must not require presence")
+
+	// An explicit user narrows to that user's credential.
+	creds, err = h.FindCredentials("teleport.example.com", "bob")
+	require.NoError(t, err)
+	require.Len(t, creds, 1)
+	assert.Equal(t, tidBob.CredentialID, creds[0].CredentialID)
+
+	// Sanity check the other credential is a distinct, discoverable device.
+	assert.NotEqual(t, tidAlice.CredentialID, tidBob.CredentialID)
+}
+
 func TestHelperAuthenticateSignsAndReusesPresence(t *testing.T) {
 	h, calls := startTestHelper(t)
 
