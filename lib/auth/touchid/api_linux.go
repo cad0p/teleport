@@ -489,6 +489,10 @@ func newSignService() *signService {
 	}
 }
 
+// verifyPresence is the user-presence check used by signService. It is a
+// package variable so tests can substitute a fake fingerprint check.
+var verifyPresence = verifyFingerprint
+
 // ensureVerified asks for a fingerprint unless a verification for uid happened
 // within the reuse window. It fails closed.
 func (s *signService) ensureVerified(uid uint32) error {
@@ -499,7 +503,7 @@ func (s *signService) ensureVerified(uid uint32) error {
 		logger.DebugContext(context.Background(), "Reusing fingerprint verification", "uid", uid)
 		return nil
 	}
-	if err := verifyFingerprint(context.Background()); err != nil {
+	if err := verifyPresence(context.Background()); err != nil {
 		return trace.Wrap(err)
 	}
 	s.verifiedAt[uid] = time.Now()
