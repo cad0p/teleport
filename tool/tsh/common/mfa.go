@@ -227,6 +227,13 @@ func (c *mfaAddCommand) run(cf *CLIConf) error {
 	if err != nil {
 		return trace.Wrap(err)
 	}
+
+	// Allow headless login for `mfa add`, mirroring `ls`/`ssh`/`scp`: with
+	// --headless, the login is approved in the browser (WebAuthn passkey) and
+	// held in the in-memory store for this single command, so a terminal
+	// device can be registered without a password or an identity file.
+	tc.AllowHeadless = true
+
 	ctx := cf.Context
 
 	// Attempt to diagnose clamshell failures.
