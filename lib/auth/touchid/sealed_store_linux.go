@@ -104,13 +104,18 @@ func sealScalarWithSEP(scalar []byte) ([]byte, error) {
 	return readKeyPayload(keyID)
 }
 
-// readKeyPayload reads a key's payload (for a trusted key, the sealed blob).
-func readKeyPayload(keyID int) ([]byte, error) {
+// maxHexPayloadSize bounds the trusted-key payload as returned by KEYCTL_READ:
+// two ASCII hex characters per sealed blob byte.
+const maxHexPayloadSize = 2 * maxBlobSize
+
+// keyctlReadPayload reads the bytes KEYCTL_READ returns for a key. It is a
+// package variable so tests can substitute a fake kernel response.
+var keyctlReadPayload = func(keyID int) ([]byte, error) {
 	n, err := unix.KeyctlBuffer(unix.KEYCTL_READ, keyID, nil, 0)
 	if err != nil {
 		return nil, trace.Wrap(err, "read sealed key length")
 	}
-	if n <= 0 || n > maxBlobSize {
+	if n <= 0 || n > maxHexPayloadSize {
 		return nil, trace.Errorf("unexpected sealed key size %d", n)
 	}
 	buf := make([]byte, n)
@@ -118,10 +123,40 @@ func readKeyPayload(keyID int) ([]byte, error) {
 	if err != nil {
 		return nil, trace.Wrap(err, "read sealed key")
 	}
-	if read <= 0 {
+	if read <= 0 || read > n {
 		return nil, trace.BadParameter("empty sealed key payload")
 	}
 	return buf[:read], nil
+}
+
+// readKeyPayload returns the sealed blob for a trusted key. KEYCTL_READ
+// exposes a trusted key's payload as an ASCII-hex string (two characters per
+// blob byte), not as the raw blob, so decode it before it reaches
+// unsealBlobWithDevice: writing the hex form to the device would have the
+// module hex-encode it again and unseal hex-of-hex, which the SEP rejects with
+// EBADMSG.
+func readKeyPayload(keyID int) ([]byte, error) {
+	payload, err := keyctlReadPayload(keyID)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return decodeSealedPayload(payload)
+}
+
+// decodeSealedPayload decodes a trusted key's ASCII-hex payload into the raw
+// sealed blob.
+func decodeSealedPayload(payload []byte) ([]byte, error) {
+	if len(payload) == 0 || len(payload)%2 != 0 {
+		return nil, trace.BadParameter("trusted key payload is not hex (length %d)", len(payload))
+	}
+	blob := make([]byte, hex.DecodedLen(len(payload)))
+	if _, err := hex.Decode(blob, payload); err != nil {
+		return nil, trace.Wrap(err, "decode trusted key payload")
+	}
+	if len(blob) > maxBlobSize {
+		return nil, trace.Errorf("unexpected sealed key size %d", len(blob))
+	}
+	return blob, nil
 }
 
 // unsealBlobWithDevice recovers the plaintext scalar from blob through the S3

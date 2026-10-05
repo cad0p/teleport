@@ -21,10 +21,13 @@
 package touchid
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"encoding/hex"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -47,6 +50,76 @@ func TestECDSAScalarRoundTrip(t *testing.T) {
 
 	_, err = ecdsaFromScalar(make([]byte, scalarLen))
 	require.Error(t, err, "zero scalar must be rejected")
+}
+
+// TestReadKeyPayloadDecodesTrustedKeyHex pins the trusted-key wire format:
+// KEYCTL_READ returns the sealed blob as an ASCII-hex string, and
+// readKeyPayload must hand the raw blob on. Regressing to the hex form makes
+// the S3 module hex-encode it again, so the SEP tries to unseal hex-of-hex and
+// fails with EBADMSG.
+func TestReadKeyPayloadDecodesTrustedKeyHex(t *testing.T) {
+	raw := bytes.Repeat([]byte{0xa7}, 113)
+
+	prev := keyctlReadPayload
+	t.Cleanup(func() { keyctlReadPayload = prev })
+	keyctlReadPayload = func(int) ([]byte, error) {
+		return []byte(hex.EncodeToString(raw)), nil
+	}
+
+	got, err := readKeyPayload(0)
+	require.NoError(t, err)
+	assert.Equal(t, raw, got, "readKeyPayload must return the raw blob, not its hex form")
+}
+
+func TestDecodeSealedPayloadRejectsNonHex(t *testing.T) {
+	for _, payload := range [][]byte{
+		nil,
+		[]byte("abc"),   // odd length
+		[]byte("zz"),    // not hex
+		[]byte("a5 b6"), // whitespace
+	} {
+		_, err := decodeSealedPayload(payload)
+		require.Error(t, err, "payload %q", payload)
+	}
+}
+
+// TestSaveKeyStoreFormat checks that the on-disk store holds the raw seal
+// output and that loadKey feeds it back to unseal unchanged, so the blob
+// format cannot silently become hex again.
+func TestSaveKeyStoreFormat(t *testing.T) {
+	dir := t.TempDir()
+	SetStoreDir(dir)
+	t.Cleanup(func() { SetStoreDir("") })
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	scalar, err := scalarBytesPadded(key.D)
+	require.NoError(t, err)
+
+	blob := bytes.Repeat([]byte{0x5a}, 113)
+
+	prevSeal, prevUnseal := sealKeyMaterial, unsealKeyMaterial
+	t.Cleanup(func() { sealKeyMaterial, unsealKeyMaterial = prevSeal, prevUnseal })
+	sealKeyMaterial = func(in []byte) ([]byte, error) {
+		assert.Equal(t, scalar, in)
+		return blob, nil
+	}
+	unsealKeyMaterial = func(in []byte) ([]byte, error) {
+		assert.Equal(t, blob, in, "unseal must receive the raw blob")
+		return scalar, nil
+	}
+
+	require.NoError(t, saveKey("format-test", key))
+
+	onDisk, err := os.ReadFile(filepath.Join(dir, "format-test.blob"))
+	require.NoError(t, err)
+	assert.Equal(t, blob, onDisk, "store must hold the raw sealed blob")
+
+	// A fresh load must read the stored blob and unseal it directly.
+	dropCachedKey("format-test")
+	loaded, err := loadKey("format-test")
+	require.NoError(t, err)
+	assert.Equal(t, key.D, loaded.D)
 }
 
 // TestSEPSealedStoreRoundTrip exercises the real seal -> unseal loop through the
