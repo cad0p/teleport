@@ -29,17 +29,19 @@ package touchid
 //
 // It stands in for the macOS Touch ID/Secure Enclave primitives with:
 //
-//   - a per-user software P-256 key, stored as a PKCS#8 PEM file under
-//     ~/.config/tsh-touchid (0600); and
+//   - a software P-256 key, sealed at rest with the SEP-backed "trusted" key
+//     source as a root-only blob under /var/lib/tsh-touchid (0600) and unsealed
+//     into the daemon's memory at start-up (see sealed_store_linux.go); and
 //   - user presence via an fprintd fingerprint verification, requested over
 //     D-Bus (net.reactivated.Fprint).
 //
-// Note that, unlike macOS, the fingerprint check is not a key-access control:
-// the private key is a regular user-owned file, so the fprintd prompt is a
-// presence check, not a security boundary. Sealing the key with the SEP
-// (route C) and running the daemon as a dedicated uid (I1b) turn this into an
-// actual boundary. For I1a the security win over S1 is that the key never
-// reaches the tsh process: tsh only sends a digest and receives a signature.
+// Note that, unlike macOS, the fingerprint check is still not a key-access
+// control: once the daemon has unsealed a key it lives in the daemon's memory,
+// and /dev/trusted_unseal is a root-only bearer oracle (S3), so the fprintd
+// prompt remains a presence check, not a cryptographic boundary. What I1b adds
+// is that the plaintext is never stored in a user-readable file, the unseal
+// happens only inside the root daemon, and the key never reaches the tsh
+// process: tsh only sends a digest and receives a signature.
 
 import (
 	"context"
@@ -55,6 +57,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -105,7 +108,20 @@ type storedCredential struct {
 // within the daemon process.
 var credsMu sync.Mutex
 
+// storeDirOverride, when set, replaces the default per-user credential store
+// directory. The privileged daemon points it at the system state directory so
+// the key material is not under the user's home.
+var storeDirOverride string
+
+// SetStoreDir overrides the credential store directory used by the daemon.
+func SetStoreDir(dir string) {
+	storeDirOverride = dir
+}
+
 func credsDir() (string, error) {
+	if storeDirOverride != "" {
+		return storeDirOverride, nil
+	}
 	base, err := os.UserConfigDir()
 	if err != nil {
 		return "", trace.Wrap(err)
@@ -198,63 +214,102 @@ func saveCreds(creds []storedCredential) error {
 	return atomicWriteFile(filepath.Join(dir, credsFileName), b, 0600)
 }
 
-func keyFilePath(credentialID string) (string, error) {
+// blobFilePath is the root-only sealed blob for a credential.
+func blobFilePath(credentialID string) (string, error) {
 	dir, err := credsDir()
 	if err != nil {
 		return "", trace.Wrap(err)
 	}
-	return filepath.Join(dir, credentialID+".pem"), nil
+	return filepath.Join(dir, credentialID+".blob"), nil
 }
 
+// keyMu guards keyCache, the in-memory copy of the unsealed keys. The plaintext
+// never touches the disk: it is sealed at rest as a blob and unsealed into this
+// map, which is reset when the daemon exits.
+var (
+	keyMu    sync.Mutex
+	keyCache = make(map[string]*ecdsa.PrivateKey)
+)
+
+func cachedKey(credentialID string) *ecdsa.PrivateKey {
+	keyMu.Lock()
+	defer keyMu.Unlock()
+	return keyCache[credentialID]
+}
+
+func cacheKey(credentialID string, key *ecdsa.PrivateKey) {
+	keyMu.Lock()
+	defer keyMu.Unlock()
+	keyCache[credentialID] = key
+}
+
+func dropCachedKey(credentialID string) {
+	keyMu.Lock()
+	defer keyMu.Unlock()
+	delete(keyCache, credentialID)
+}
+
+// saveKey seals the private scalar, verifies the seal round-trips, and writes
+// the root-only blob. It fails closed: a blob that cannot be unsealed is never
+// persisted.
 func saveKey(credentialID string, key *ecdsa.PrivateKey) error {
 	if _, err := ensureCredsDir(); err != nil {
 		return trace.Wrap(err)
 	}
-	path, err := keyFilePath(credentialID)
+	if key.Curve != elliptic.P256() {
+		return trace.BadParameter("unexpected key curve %q", key.Curve.Params().Name)
+	}
+	scalar, err := scalarBytesPadded(key.D)
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	der, err := x509.MarshalPKCS8PrivateKey(key)
+	blob, err := verifySealRoundTrip(scalar)
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	pemBytes := pem.EncodeToMemory(&pem.Block{Type: keyPEMType, Bytes: der})
-	return atomicWriteFile(path, pemBytes, 0600)
+	path, err := blobFilePath(credentialID)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	if err := atomicWriteFile(path, blob, 0600); err != nil {
+		return trace.Wrap(err)
+	}
+	cacheKey(credentialID, key)
+	return nil
 }
 
+// loadKey returns the credential key from memory, unsealing the blob on first
+// use.
 func loadKey(credentialID string) (*ecdsa.PrivateKey, error) {
-	path, err := keyFilePath(credentialID)
+	if key := cachedKey(credentialID); key != nil {
+		return key, nil
+	}
+	path, err := blobFilePath(credentialID)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	b, err := os.ReadFile(path)
+	blob, err := os.ReadFile(path)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		return nil, ErrCredentialNotFound
 	case err != nil:
 		return nil, trace.Wrap(err)
 	}
-
-	block, _ := pem.Decode(b)
-	if block == nil || block.Type != keyPEMType {
-		return nil, fmt.Errorf("failed to decode key %q", path)
+	scalar, err := unsealKeyMaterial(blob)
+	if err != nil {
+		return nil, trace.Wrap(err, "unseal key")
 	}
-	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	key, err := ecdsaFromScalar(scalar)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	key, ok := parsed.(*ecdsa.PrivateKey)
-	if !ok {
-		return nil, fmt.Errorf("unexpected key type %T in %q", parsed, path)
-	}
-	if key.Curve != elliptic.P256() {
-		return nil, fmt.Errorf("unexpected key curve %q in %q", key.Curve.Params().Name, path)
-	}
+	cacheKey(credentialID, key)
 	return key, nil
 }
 
 func deleteKey(credentialID string) error {
-	path, err := keyFilePath(credentialID)
+	dropCachedKey(credentialID)
+	path, err := blobFilePath(credentialID)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -265,6 +320,57 @@ func deleteKey(credentialID string) error {
 		return trace.Wrap(err)
 	}
 	return nil
+}
+
+// PreloadAllKeys unseals every credential key into memory before the daemon
+// starts serving, so a blob that cannot be unsealed makes start-up fail closed
+// (seal success does not prove unsealability).
+func PreloadAllKeys() error {
+	credsMu.Lock()
+	defer credsMu.Unlock()
+
+	creds, err := loadCreds()
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	for _, c := range creds {
+		if _, err := loadKey(c.CredentialID); err != nil {
+			return trace.Wrap(err, "credential %q", c.CredentialID)
+		}
+	}
+	logger.InfoContext(context.Background(), "Unsealed touch ID credential keys", "count", len(creds))
+	return nil
+}
+
+// ImportPlaintextPEM seals a PKCS#8 PEM private key into the store, used by the
+// one-time I1a -> I1b migration. The plaintext source file must be removed by
+// the caller afterwards.
+func ImportPlaintextPEM(credentialID string, pemData []byte) error {
+	key, err := parsePKCS8PEM(credentialID, pemData)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	return trace.Wrap(saveKey(credentialID, key))
+}
+
+// parsePKCS8PEM parses a P-256 PKCS#8 PEM private key.
+func parsePKCS8PEM(name string, b []byte) (*ecdsa.PrivateKey, error) {
+	block, _ := pem.Decode(b)
+	if block == nil || block.Type != keyPEMType {
+		return nil, fmt.Errorf("failed to decode key %q", name)
+	}
+	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	key, ok := parsed.(*ecdsa.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("unexpected key type %T in %q", parsed, name)
+	}
+	if key.Curve != elliptic.P256() {
+		return nil, fmt.Errorf("unexpected key curve %q in %q", key.Curve.Params().Name, name)
+	}
+	return key, nil
 }
 
 func (c storedCredential) info() (*CredentialInfo, error) {
@@ -295,8 +401,9 @@ func (c storedCredential) info() (*CredentialInfo, error) {
 //   - HasCompileSupport/HasSignature: always true, this is the touchid build.
 //   - HasEntitlements: fprintd is reachable and reports a default device.
 //   - PassedLAPolicyTest: fprintd has at least one enrolled fingerprint.
-//   - PassedSecureEnclaveTest: the software key store is usable.
-func diag() (*DiagResult, error) {
+//   - PassedSecureEnclaveTest: the sealed key store is usable, i.e. the system
+//     store directory exists and the unseal device is present.
+func diag(uid uint32) (*DiagResult, error) {
 	res := &DiagResult{
 		HasCompileSupport: true,
 		HasSignature:      true,
@@ -304,6 +411,8 @@ func diag() (*DiagResult, error) {
 
 	if _, err := ensureCredsDir(); err != nil {
 		logger.WarnContext(context.Background(), "Touch ID credential store is not usable", "error", err)
+	} else if _, err := os.Stat(trustedUnsealDevice); err != nil {
+		logger.WarnContext(context.Background(), "Touch ID unseal device is not available", "error", err)
 	} else {
 		res.PassedSecureEnclaveTest = true
 	}
@@ -315,7 +424,7 @@ func diag() (*DiagResult, error) {
 	}
 	res.HasEntitlements = true
 
-	fingers, err := dev.listEnrolledFingers()
+	fingers, err := dev.listEnrolledFingers(usernameForUID(uid))
 	if err != nil {
 		logger.DebugContext(context.Background(), "Failed to list enrolled fingerprints", "error", err)
 		return res, nil
@@ -503,7 +612,7 @@ func (s *signService) ensureVerified(uid uint32) error {
 		logger.DebugContext(context.Background(), "Reusing fingerprint verification", "uid", uid)
 		return nil
 	}
-	if err := verifyPresence(context.Background()); err != nil {
+	if err := verifyPresence(context.Background(), uid); err != nil {
 		return trace.Wrap(err)
 	}
 	s.verifiedAt[uid] = time.Now()
@@ -594,24 +703,26 @@ func newFprintdDevice() (*fprintdDevice, error) {
 	}, nil
 }
 
-// usernameArg returns the username argument for fprintd calls.
-//
-// A non-root caller passes an empty string, which fprintd maps to the caller's
-// session user without requiring the "setusername" polkit action. Root must be
-// explicit, since it has no prints of its own.
-func usernameArg() string {
-	if os.Geteuid() != 0 {
+// usernameForUID maps a client uid to the fprintd username argument. When the
+// caller uid is the daemon's own uid (the unprivileged dev shape), an empty
+// string maps to the caller's session user without requiring the "setusername"
+// polkit action. When the daemon runs as a different uid (root in the hardened
+// shape), fprintd needs the explicit target username, which root is allowed to
+// pass (S4).
+func usernameForUID(uid uint32) string {
+	if uid == uint32(os.Geteuid()) {
 		return ""
 	}
-	u, err := user.Current()
+	u, err := user.LookupId(strconv.FormatUint(uint64(uid), 10))
 	if err != nil {
+		logger.WarnContext(context.Background(), "Failed to resolve uid for fingerprint verification", "uid", uid, "error", err)
 		return ""
 	}
 	return u.Username
 }
 
-func (d *fprintdDevice) listEnrolledFingers() ([]string, error) {
-	call := d.conn.Object(fprintdBusName, d.path).Call(fprintdDeviceIface+".ListEnrolledFingers", 0, usernameArg())
+func (d *fprintdDevice) listEnrolledFingers(username string) ([]string, error) {
+	call := d.conn.Object(fprintdBusName, d.path).Call(fprintdDeviceIface+".ListEnrolledFingers", 0, username)
 	if call.Err != nil {
 		return nil, trace.Wrap(call.Err)
 	}
@@ -629,13 +740,14 @@ var errFingerprintDevice = errors.New("fingerprint device error")
 var fprintdMu sync.Mutex
 
 // verify asks the user for a fingerprint and blocks until the verification
-// succeeds, fails or times out.
-func (d *fprintdDevice) verify(ctx context.Context) error {
+// succeeds, fails or times out. username is the account whose prints are
+// checked; an empty string means the caller's session user.
+func (d *fprintdDevice) verify(ctx context.Context, username string) error {
 	fprintdMu.Lock()
 	defer fprintdMu.Unlock()
 
 	obj := d.conn.Object(fprintdBusName, d.path)
-	if err := obj.Call(fprintdDeviceIface+".Claim", 0, usernameArg()).Err; err != nil {
+	if err := obj.Call(fprintdDeviceIface+".Claim", 0, username).Err; err != nil {
 		return trace.Wrap(err, "failed to claim the fingerprint device")
 	}
 	defer func() {
@@ -741,10 +853,10 @@ func waitVerifyStatus(ctx context.Context, sigs <-chan *dbus.Signal, path dbus.O
 	}
 }
 
-func verifyFingerprint(ctx context.Context) error {
+func verifyFingerprint(ctx context.Context, uid uint32) error {
 	dev, err := newFprintdDevice()
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	return dev.verify(ctx)
+	return dev.verify(ctx, usernameForUID(uid))
 }

@@ -1,0 +1,28 @@
+[Unit]
+Description=Teleport Touch ID helper
+Documentation=https://github.com/gravitational/teleport
+# The daemon unseals its key material through /dev/trusted_unseal, which is
+# created by the out-of-tree s3_unseal module loaded by systemd-modules-load.
+After=systemd-modules-load.service
+Wants=systemd-modules-load.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tsh-touchid-helper --socket /run/tsh-touchid/helper.sock --allowed-uids 1001 --store /var/lib/tsh-touchid
+RuntimeDirectory=tsh-touchid
+RuntimeDirectoryMode=0755
+StateDirectory=tsh-touchid
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=2
+
+# The daemon must run as root: fprintd's polkit check for
+# net.reactivated.fprint.device.setusername requires it when verifying another
+# user, and /dev/trusted_unseal is 0600 root. The system socket is connectable
+# by any local user, but SO_PEERCRED rejects everyone outside --allowed-uids.
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

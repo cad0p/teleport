@@ -27,6 +27,7 @@ import (
 	"crypto/sha256"
 	"net"
 	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 
@@ -35,16 +36,17 @@ import (
 )
 
 // startTestHelper wires a helperNative client to a real HelperServer over a
-// unix socket in a temp dir, with fprintd presence replaced by a counting fake.
-// It returns the client and the number of fake presence checks so far.
+// unix socket in a temp dir, with fprintd presence and SEP sealing replaced by
+// in-memory fakes. It returns the client and the number of fake presence checks
+// so far.
 func startTestHelper(t *testing.T) (*helperNative, *int32) {
 	t.Helper()
 
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
 
-	path, err := helperSocketPath()
-	require.NoError(t, err)
+	path := filepath.Join(t.TempDir(), helperSocketName)
+	t.Setenv("TSH_TOUCHID_SOCKET", path)
 
 	l, err := net.Listen("unix", path)
 	require.NoError(t, err)
@@ -63,11 +65,18 @@ func startTestHelper(t *testing.T) (*helperNative, *int32) {
 
 	var calls int32
 	prev := verifyPresence
-	verifyPresence = func(context.Context) error {
+	verifyPresence = func(context.Context, uint32) error {
 		atomic.AddInt32(&calls, 1)
 		return nil
 	}
 	t.Cleanup(func() { verifyPresence = prev })
+
+	// Fake the SEP seal/unseal: identity keeps the round-trip self-check honest
+	// without the unseal device.
+	prevSeal, prevUnseal := sealKeyMaterial, unsealKeyMaterial
+	sealKeyMaterial = func(scalar []byte) ([]byte, error) { return append([]byte(nil), scalar...), nil }
+	unsealKeyMaterial = func(blob []byte) ([]byte, error) { return append([]byte(nil), blob...), nil }
+	t.Cleanup(func() { sealKeyMaterial, unsealKeyMaterial = prevSeal, prevUnseal })
 
 	return &helperNative{}, &calls
 }

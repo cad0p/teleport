@@ -18,13 +18,15 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-// tsh-touchid-helper is the Linux Touch ID helper daemon. It owns the software
-// P-256 credentials and performs user presence via fprintd, exposing the same
-// JSON-RPC protocol as the macOS helper (PR #64128) over an AF_UNIX socket.
+// tsh-touchid-helper is the Linux Touch ID helper daemon. It owns the P-256
+// credentials, keeps them SEP-sealed at rest, and performs user presence via
+// fprintd, exposing the same JSON-RPC protocol as the macOS helper (PR #64128)
+// over an AF_UNIX socket.
 //
-// It is meant to run inside the user's active session (so fprintd's polkit
-// checks pass) and is reachable only by that user: the socket is 0600 and every
-// connection is checked against the configured uid via SO_PEERCRED.
+// In the hardened shape it runs as root: the system socket lives at
+// /run/tsh-touchid/helper.sock and the sealed blobs under /var/lib/tsh-touchid.
+// Every connection is checked against an explicit uid allow-list via
+// SO_PEERCRED, and the keys are unsealed into memory at start-up (fail closed).
 package main
 
 import (
@@ -36,6 +38,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -43,27 +47,95 @@ import (
 	"github.com/gravitational/teleport/lib/auth/touchid"
 )
 
-func main() {
-	socketFlag := flag.String("socket", "", "AF_UNIX socket path (default $XDG_RUNTIME_DIR/tsh-touchid.sock)")
-	uidFlag := flag.Int("uid", -1, "only accept connections from this uid (default: the current uid)")
-	flag.Parse()
+const systemSocketPath = "/run/tsh-touchid/helper.sock"
 
-	allowedUID := os.Getuid()
-	if *uidFlag >= 0 {
-		allowedUID = *uidFlag
+func main() {
+	if len(os.Args) > 1 && os.Args[1] == "seal-pem" {
+		sealPEM(os.Args[2:])
+		return
+	}
+	runDaemon(os.Args[1:])
+}
+
+// sealPEM is the one-time I1a -> I1b migration: seal a plaintext PKCS#8 PEM into
+// the store and verify the seal round-trips. It is run as root by the install
+// script; the caller removes the plaintext source afterwards.
+func sealPEM(args []string) {
+	fs := flag.NewFlagSet("seal-pem", flag.ExitOnError)
+	store := fs.String("store", "", "credential store directory (required)")
+	pemPath := fs.String("pem", "", "path to the PKCS#8 PEM key (required)")
+	credID := fs.String("id", "", "credential id (default: the PEM file base name)")
+	_ = fs.Parse(args)
+
+	if *store == "" || *pemPath == "" {
+		fatal(errors.New("seal-pem: -store and -pem are required"))
+	}
+	id := *credID
+	if id == "" {
+		id = strings.TrimSuffix(filepath.Base(*pemPath), filepath.Ext(*pemPath))
+	}
+
+	data, err := os.ReadFile(*pemPath)
+	if err != nil {
+		fatal(fmt.Errorf("seal-pem: read %s: %w", *pemPath, err))
+	}
+
+	touchid.SetStoreDir(*store)
+	if err := touchid.ImportPlaintextPEM(id, data); err != nil {
+		fatal(fmt.Errorf("seal-pem: %s: %w", id, err))
+	}
+	fmt.Printf("sealed id=%s blob=%s round_trip=ok\n", id, filepath.Join(*store, id+".blob"))
+}
+
+func runDaemon(args []string) {
+	fs := flag.NewFlagSet("tsh-touchid-helper", flag.ExitOnError)
+	socketFlag := fs.String("socket", "", "AF_UNIX socket path (default: the system socket as root, the per-user socket otherwise)")
+	uidsFlag := fs.String("allowed-uids", "", "comma-separated uids allowed to connect (default: the daemon's own uid)")
+	storeFlag := fs.String("store", "", "credential store directory (default: the user config dir)")
+	_ = fs.Parse(args)
+
+	if *storeFlag != "" {
+		touchid.SetStoreDir(*storeFlag)
+	}
+
+	allowed, err := parseAllowedUIDs(*uidsFlag, uint32(os.Getuid()))
+	if err != nil {
+		fatal(err)
 	}
 
 	socketPath := *socketFlag
 	if socketPath == "" {
-		p, err := touchid.HelperSocketPath()
-		if err != nil {
-			fatal(err)
+		if os.Geteuid() == 0 {
+			socketPath = systemSocketPath
+		} else {
+			p, err := touchid.HelperSocketPath()
+			if err != nil {
+				fatal(err)
+			}
+			socketPath = p
 		}
-		socketPath = p
 	}
 
-	if err := os.MkdirAll(filepath.Dir(socketPath), 0700); err != nil {
+	// The socket directory must not be writable by anyone but root, otherwise
+	// the socket could be swapped; the socket itself is connectable because
+	// SO_PEERCRED, not the file mode, is the access control.
+	socketDirMode := os.FileMode(0700)
+	socketMode := os.FileMode(0600)
+	if os.Geteuid() == 0 {
+		socketDirMode = 0755
+		socketMode = 0666
+	}
+	if err := os.MkdirAll(filepath.Dir(socketPath), socketDirMode); err != nil {
 		fatal(fmt.Errorf("create socket dir: %w", err))
+	}
+	if err := os.Chmod(filepath.Dir(socketPath), socketDirMode); err != nil {
+		fatal(fmt.Errorf("chmod socket dir: %w", err))
+	}
+
+	// Unseal every credential before serving so a blob that cannot be unsealed
+	// stops the daemon (fail closed).
+	if err := touchid.PreloadAllKeys(); err != nil {
+		fatal(fmt.Errorf("failed to unseal credential keys (fail closed): %w", err))
 	}
 
 	// Refuse to stomp on a running daemon; remove a stale socket otherwise.
@@ -81,12 +153,12 @@ func main() {
 	if err != nil {
 		fatal(fmt.Errorf("listen on %s: %w", socketPath, err))
 	}
-	if err := os.Chmod(socketPath, 0600); err != nil {
+	if err := os.Chmod(socketPath, socketMode); err != nil {
 		fatal(fmt.Errorf("chmod socket: %w", err))
 	}
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.Printf("tsh-touchid-helper listening on %s (uid %d)", socketPath, allowedUID)
+	log.Printf("tsh-touchid-helper listening on %s (uid %d, allowed %v)", socketPath, os.Getuid(), allowed)
 
 	// Clean up the socket on shutdown.
 	sigc := make(chan os.Signal, 1)
@@ -116,8 +188,8 @@ func main() {
 			_ = conn.Close()
 			continue
 		}
-		if uid != uint32(allowedUID) {
-			log.Printf("rejecting connection from uid %d (allowed uid %d)", uid, allowedUID)
+		if !allowed[uid] {
+			log.Printf("rejecting connection from uid %d (allowed %v)", uid, allowed)
 			_ = conn.Close()
 			continue
 		}
@@ -128,6 +200,30 @@ func main() {
 			}
 		}(conn, uid)
 	}
+}
+
+// parseAllowedUIDs parses a comma-separated uid allow-list. An empty list means
+// "only the daemon's own uid".
+func parseAllowedUIDs(s string, ownUID uint32) (map[uint32]bool, error) {
+	if strings.TrimSpace(s) == "" {
+		return map[uint32]bool{ownUID: true}, nil
+	}
+	out := make(map[uint32]bool)
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		v, err := strconv.ParseUint(part, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("invalid uid %q: %w", part, err)
+		}
+		out[uint32(v)] = true
+	}
+	if len(out) == 0 {
+		return nil, errors.New("allowed-uids is empty")
+	}
+	return out, nil
 }
 
 // peerUID returns the uid of the process on the other end of an AF_UNIX

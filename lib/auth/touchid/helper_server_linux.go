@@ -44,12 +44,22 @@ import (
 // helperSocketName is the AF_UNIX socket file name.
 const helperSocketName = "tsh-touchid.sock"
 
+// systemHelperSocketPath is the hardened, system-wide socket used by the
+// privileged daemon.
+const systemHelperSocketPath = "/run/tsh-touchid/helper.sock"
+
 // helperSocketPath returns the AF_UNIX socket the helper daemon listens on.
 //
-// It prefers $XDG_RUNTIME_DIR/tsh-touchid.sock; when XDG_RUNTIME_DIR is unset
-// (e.g. a bare SSH session) it falls back to the credential directory, which is
-// still a per-user 0700 directory.
+// The system socket takes precedence when present (the hardened daemon shape);
+// otherwise it falls back to the per-user dev socket. $TSH_TOUCHID_SOCKET wins
+// over both, for tests and non-standard layouts.
 func helperSocketPath() (string, error) {
+	if p := os.Getenv("TSH_TOUCHID_SOCKET"); p != "" {
+		return p, nil
+	}
+	if _, err := os.Stat(systemHelperSocketPath); err == nil {
+		return systemHelperSocketPath, nil
+	}
 	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
 		return filepath.Join(dir, helperSocketName), nil
 	}
@@ -129,7 +139,7 @@ func (s *HelperServer) ServeConn(conn net.Conn, uid uint32) error {
 func (s *HelperServer) dispatch(uid uint32, req *helperRequest) (any, error) {
 	switch req.Method {
 	case helperMethodDiag:
-		res, err := diag()
+		res, err := diag(uid)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
