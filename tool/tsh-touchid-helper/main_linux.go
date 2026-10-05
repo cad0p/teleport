@@ -92,6 +92,7 @@ func runDaemon(args []string) {
 	socketFlag := fs.String("socket", "", "AF_UNIX socket path (default: the system socket as root, the per-user socket otherwise)")
 	uidsFlag := fs.String("allowed-uids", "", "comma-separated uids allowed to connect (default: the daemon's own uid)")
 	storeFlag := fs.String("store", "", "credential store directory (default: the user config dir)")
+	unsealTimeout := fs.Duration("unseal-timeout", touchid.DefaultSEPReadyTimeout, "bound on waiting for the SEP key store and retrying the credential unseal at start-up before failing closed")
 	_ = fs.Parse(args)
 
 	if *storeFlag != "" {
@@ -133,8 +134,11 @@ func runDaemon(args []string) {
 	}
 
 	// Unseal every credential before serving so a blob that cannot be unsealed
-	// stops the daemon (fail closed).
-	if err := touchid.PreloadAllKeys(); err != nil {
+	// stops the daemon (fail closed). At boot the SEP key store may still be
+	// coming up, so wait on the driver's readiness signal and retry with
+	// backoff instead of relying on systemd restarts.
+	log.Printf("unsealing credential store (up to %s)", *unsealTimeout)
+	if err := touchid.UnsealWithBackoff(*unsealTimeout); err != nil {
 		fatal(fmt.Errorf("failed to unseal credential keys (fail closed): %w", err))
 	}
 

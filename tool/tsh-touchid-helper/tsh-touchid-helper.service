@@ -13,6 +13,10 @@ RuntimeDirectory=tsh-touchid
 RuntimeDirectoryMode=0755
 StateDirectory=tsh-touchid
 StateDirectoryMode=0700
+# The daemon waits for the SEP key store and retries its unseal inside the
+# process at start-up (see lib/auth/touchid/sep_readiness_linux.go), so a boot
+# race is handled without a restart; Restart=on-failure remains only as the
+# outer backstop for a hard failure.
 Restart=on-failure
 RestartSec=2
 
