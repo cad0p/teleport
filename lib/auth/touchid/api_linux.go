@@ -20,8 +20,12 @@
 
 package touchid
 
-// Linux implementation of the nativeTID interface, enabled with the "touchid"
-// build tag.
+// Linux implementation of the Touch ID helper daemon, enabled with the
+// "touchid" build tag.
+//
+// This file holds the daemon-side "core": the credential store and the fprintd
+// presence check. It is intentionally separate from the tsh-side client
+// (api_linux_helper.go), which talks to this core over an AF_UNIX socket.
 //
 // It stands in for the macOS Touch ID/Secure Enclave primitives with:
 //
@@ -32,9 +36,10 @@ package touchid
 //
 // Note that, unlike macOS, the fingerprint check is not a key-access control:
 // the private key is a regular user-owned file, so the fprintd prompt is a
-// presence check, not a security boundary. Anything running as the user can
-// read the key. This matches "route B" of the Touch ID on Linux research plan
-// and is meant to be hardened later (SEP sealing, route C).
+// presence check, not a security boundary. Sealing the key with the SEP
+// (route C) and running the daemon as a dedicated uid (I1b) turn this into an
+// actual boundary. For I1a the security win over S1 is that the key never
+// reaches the tsh process: tsh only sends a digest and receives a signature.
 
 import (
 	"context"
@@ -87,10 +92,6 @@ const (
 	fprintdDeviceIface  = "net.reactivated.Fprint.Device"
 )
 
-var native nativeTID = &touchIDImpl{}
-
-type touchIDImpl struct{}
-
 // storedCredential is the metadata persisted for each Linux touchid credential.
 type storedCredential struct {
 	CredentialID string    `json:"credential_id"`
@@ -101,8 +102,7 @@ type storedCredential struct {
 }
 
 // credsMu serializes read-modify-write cycles on the credentials metadata
-// within the process. Multi-process races are possible but benign for the
-// expected usage (a single tsh invocation).
+// within the daemon process.
 var credsMu sync.Mutex
 
 func credsDir() (string, error) {
@@ -288,7 +288,7 @@ func (c storedCredential) info() (*CredentialInfo, error) {
 	}, nil
 }
 
-// Diag returns diagnostics about the Linux touchid backend.
+// diag returns diagnostics about the Linux touchid backend.
 //
 // There is no Secure Enclave or code signature to test, so the macOS-specific
 // checks are mapped as follows:
@@ -296,7 +296,7 @@ func (c storedCredential) info() (*CredentialInfo, error) {
 //   - HasEntitlements: fprintd is reachable and reports a default device.
 //   - PassedLAPolicyTest: fprintd has at least one enrolled fingerprint.
 //   - PassedSecureEnclaveTest: the software key store is usable.
-func (touchIDImpl) Diag() (*DiagResult, error) {
+func diag() (*DiagResult, error) {
 	res := &DiagResult{
 		HasCompileSupport: true,
 		HasSignature:      true,
@@ -330,11 +330,10 @@ func (touchIDImpl) Diag() (*DiagResult, error) {
 	return res, nil
 }
 
-func (touchIDImpl) NewAuthContext() AuthContext {
-	return &linuxAuthContext{}
-}
-
-func (touchIDImpl) Register(rpID, user string, userHandle []byte) (*CredentialInfo, error) {
+// registerCredential creates a new software P-256 credential. It does not
+// require user presence; the WebAuthn registration flow performs the
+// attestation signature, which does.
+func registerCredential(rpID, user string, userHandle []byte) (*CredentialInfo, error) {
 	if rpID == "" {
 		return nil, trace.BadParameter("rpID required")
 	}
@@ -374,34 +373,9 @@ func (touchIDImpl) Register(rpID, user string, userHandle []byte) (*CredentialIn
 	}, nil
 }
 
-func (touchIDImpl) Authenticate(actx AuthContext, credentialID string, digest []byte) ([]byte, error) {
-	// Load the key first, so a missing credential doesn't trigger a pointless
-	// fingerprint prompt.
-	key, err := loadKey(credentialID)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	switch ctx := actx.(type) {
-	case nil:
-		if err := verifyFingerprint(context.Background()); err != nil {
-			return nil, trace.Wrap(err)
-		}
-	case *linuxAuthContext:
-		if err := ctx.verify(); err != nil {
-			return nil, trace.Wrap(err)
-		}
-	default:
-		if err := verifyFingerprint(context.Background()); err != nil {
-			return nil, trace.Wrap(err)
-		}
-	}
-
-	sig, err := ecdsa.SignASN1(rand.Reader, key, digest)
-	return sig, trace.Wrap(err)
-}
-
-func (touchIDImpl) FindCredentials(rpID, user string) ([]CredentialInfo, error) {
+// findCredentialInfos finds credentials without user interaction.
+// An empty user means "all users".
+func findCredentialInfos(rpID, user string) ([]CredentialInfo, error) {
 	credsMu.Lock()
 	defer credsMu.Unlock()
 
@@ -428,13 +402,8 @@ func (touchIDImpl) FindCredentials(rpID, user string) ([]CredentialInfo, error) 
 	return infos, nil
 }
 
-func (touchIDImpl) ListCredentials() ([]CredentialInfo, error) {
-	// Match macOS semantics: listing requires user interaction (the fprintd
-	// prompt), even though the metadata itself is a regular user-owned file.
-	if err := verifyFingerprint(context.Background()); err != nil {
-		return nil, trace.Wrap(err)
-	}
-
+// listCredentialInfos lists all credentials without user interaction.
+func listCredentialInfos() ([]CredentialInfo, error) {
 	credsMu.Lock()
 	defer credsMu.Unlock()
 
@@ -455,15 +424,19 @@ func (touchIDImpl) ListCredentials() ([]CredentialInfo, error) {
 	return infos, nil
 }
 
-func (touchIDImpl) DeleteCredential(credentialID string) error {
-	// Match macOS semantics: deletion requires user interaction.
-	if err := verifyFingerprint(context.Background()); err != nil {
-		return trace.Wrap(err)
+// loadAndSign signs digest with the credential key. It does not itself ask for
+// user presence; callers are expected to have verified it already.
+func loadAndSign(credentialID string, digest []byte) ([]byte, error) {
+	key, err := loadKey(credentialID)
+	if err != nil {
+		return nil, trace.Wrap(err)
 	}
-	return touchIDImpl{}.DeleteNonInteractive(credentialID)
+	sig, err := ecdsa.SignASN1(rand.Reader, key, digest)
+	return sig, trace.Wrap(err)
 }
 
-func (touchIDImpl) DeleteNonInteractive(credentialID string) error {
+// deleteCredentialNonInteractive deletes a credential without user interaction.
+func deleteCredentialNonInteractive(credentialID string) error {
 	if credentialID == "" {
 		return trace.BadParameter("credentialID required")
 	}
@@ -494,54 +467,91 @@ func (touchIDImpl) DeleteNonInteractive(credentialID string) error {
 	return deleteKey(credentialID)
 }
 
-// linuxAuthContext is the Linux AuthContext implementation.
-//
-// A successful fingerprint verification is remembered for
-// fingerprintReuseWindow, mirroring the short reuse window of macOS LAContext.
-type linuxAuthContext struct {
-	mu         sync.Mutex
-	verifiedAt time.Time
-	closed     bool
+// signService is the stateful daemon side of the helper. It enforces user
+// presence (with the macOS-parity reuse window) around the credential-store
+// operations above, keyed by the SO_PEERCRED uid of the calling connection.
+type signService struct {
+	// verifyMu serializes presence checks, so concurrent connections don't
+	// stack up fprintd prompts.
+	verifyMu sync.Mutex
+	// verifiedAt records, per uid, when presence was last confirmed.
+	verifiedAt map[uint32]time.Time
+
+	mu            sync.Mutex
+	nextContextID int
+	contexts      map[int]uint32
 }
 
-func (c *linuxAuthContext) Guard(fn func()) error {
-	if err := c.verify(); err != nil {
-		return trace.Wrap(err)
+func newSignService() *signService {
+	return &signService{
+		verifiedAt: make(map[uint32]time.Time),
+		contexts:   make(map[int]uint32),
 	}
-	fn()
-	return nil
 }
 
-func (c *linuxAuthContext) Close() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.closed = true
-}
+// ensureVerified asks for a fingerprint unless a verification for uid happened
+// within the reuse window. It fails closed.
+func (s *signService) ensureVerified(uid uint32) error {
+	s.verifyMu.Lock()
+	defer s.verifyMu.Unlock()
 
-func (c *linuxAuthContext) verify() error {
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
-		return errors.New("authentication context is closed")
-	}
-	if time.Since(c.verifiedAt) < fingerprintReuseWindow {
-		c.mu.Unlock()
+	if t, ok := s.verifiedAt[uid]; ok && time.Since(t) < fingerprintReuseWindow {
+		logger.DebugContext(context.Background(), "Reusing fingerprint verification", "uid", uid)
 		return nil
 	}
-	c.mu.Unlock()
-
-	// Don't hold the lock while prompting, so concurrent Guards don't serialize
-	// behind a multi-second fingerprint prompt.
 	if err := verifyFingerprint(context.Background()); err != nil {
 		return trace.Wrap(err)
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.verifiedAt.IsZero() || time.Since(c.verifiedAt) >= fingerprintReuseWindow {
-		c.verifiedAt = time.Now()
-	}
+	s.verifiedAt[uid] = time.Now()
 	return nil
+}
+
+// newAuthContext allocates a context for uid and returns its ID.
+func (s *signService) newAuthContext(uid uint32) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nextContextID++
+	s.contexts[s.nextContextID] = uid
+	return s.nextContextID
+}
+
+// closeAuthContext drops a context. It is a no-op if the ID is unknown.
+func (s *signService) closeAuthContext(contextID int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.contexts, contextID)
+}
+
+// authContextUID returns the uid a context belongs to, if it exists.
+func (s *signService) authContextUID(contextID int) (uint32, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	uid, ok := s.contexts[contextID]
+	return uid, ok
+}
+
+func (s *signService) authenticate(uid uint32, credentialID string, digest []byte) ([]byte, error) {
+	if err := s.ensureVerified(uid); err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return loadAndSign(credentialID, digest)
+}
+
+func (s *signService) listCredentials(uid uint32) ([]CredentialInfo, error) {
+	// Match macOS semantics: listing requires user interaction (the fprintd
+	// prompt), even though the metadata itself is a regular user-owned file.
+	if err := s.ensureVerified(uid); err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return listCredentialInfos()
+}
+
+func (s *signService) deleteCredential(uid uint32, credentialID string) error {
+	// Match macOS semantics: deletion requires user interaction.
+	if err := s.ensureVerified(uid); err != nil {
+		return trace.Wrap(err)
+	}
+	return deleteCredentialNonInteractive(credentialID)
 }
 
 // fprintdDevice is a handle to an fprintd D-Bus device.
