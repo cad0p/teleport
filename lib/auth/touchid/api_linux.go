@@ -1,0 +1,736 @@
+//go:build touchid
+
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+package touchid
+
+// Linux implementation of the nativeTID interface, enabled with the "touchid"
+// build tag.
+//
+// It stands in for the macOS Touch ID/Secure Enclave primitives with:
+//
+//   - a per-user software P-256 key, stored as a PKCS#8 PEM file under
+//     ~/.config/tsh-touchid (0600); and
+//   - user presence via an fprintd fingerprint verification, requested over
+//     D-Bus (net.reactivated.Fprint).
+//
+// Note that, unlike macOS, the fingerprint check is not a key-access control:
+// the private key is a regular user-owned file, so the fprintd prompt is a
+// presence check, not a security boundary. Anything running as the user can
+// read the key. This matches "route B" of the Touch ID on Linux research plan
+// and is meant to be hardened later (SEP sealing, route C).
+
+import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"os"
+	"os/user"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/godbus/dbus/v5"
+	"github.com/google/uuid"
+	"github.com/gravitational/trace"
+)
+
+const (
+	// credsDirName is the directory, relative to the user's config directory,
+	// where Linux touchid credentials are stored.
+	credsDirName = "tsh-touchid"
+	// credsFileName is the credentials metadata file.
+	credsFileName = "credentials.json"
+
+	// keyPEMType is the PEM block type used for private keys.
+	keyPEMType = "PRIVATE KEY"
+
+	// fingerprintReuseWindow is how long a successful fingerprint verification
+	// is reused, mirroring the ~10s reuse window of macOS LAContext.
+	fingerprintReuseWindow = 10 * time.Second
+	// fingerprintVerifyTimeout is how long we wait for a fingerprint before
+	// giving up on a single verification attempt.
+	fingerprintVerifyTimeout = 60 * time.Second
+	// fingerprintVerifyAttempts is how many times a verification is started
+	// before giving up. The aurora-linux apple_sep driver can fail a capture
+	// with a transient device error right after the sensor is (re)registered
+	// (aurora-linux #25); the next VerifyStart usually arms the sensor again.
+	fingerprintVerifyAttempts = 4
+
+	// fprintd D-Bus coordinates.
+	fprintdBusName      = "net.reactivated.Fprint"
+	fprintdManagerPath  = dbus.ObjectPath("/net/reactivated/Fprint/Manager")
+	fprintdManagerIface = "net.reactivated.Fprint.Manager"
+	fprintdDeviceIface  = "net.reactivated.Fprint.Device"
+)
+
+var native nativeTID = &touchIDImpl{}
+
+type touchIDImpl struct{}
+
+// storedCredential is the metadata persisted for each Linux touchid credential.
+type storedCredential struct {
+	CredentialID string    `json:"credential_id"`
+	RPID         string    `json:"rp_id"`
+	UserName     string    `json:"user_name"`
+	UserHandle   string    `json:"user_handle"` // base64.RawURLEncoding
+	CreateTime   time.Time `json:"create_time"`
+}
+
+// credsMu serializes read-modify-write cycles on the credentials metadata
+// within the process. Multi-process races are possible but benign for the
+// expected usage (a single tsh invocation).
+var credsMu sync.Mutex
+
+func credsDir() (string, error) {
+	base, err := os.UserConfigDir()
+	if err != nil {
+		return "", trace.Wrap(err)
+	}
+	return filepath.Join(base, credsDirName), nil
+}
+
+// ensureCredsDir creates the credentials directory (0700) if needed.
+func ensureCredsDir() (string, error) {
+	dir, err := credsDir()
+	if err != nil {
+		return "", trace.Wrap(err)
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", trace.Wrap(err)
+	}
+	// Defend against a pre-existing directory with lax permissions and a
+	// restrictive umask on create.
+	if err := os.Chmod(dir, 0700); err != nil {
+		return "", trace.Wrap(err)
+	}
+	return dir, nil
+}
+
+// atomicWriteFile writes data to path, atomically, with the given permissions.
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		if tmpName != "" {
+			os.Remove(tmpName)
+		}
+	}()
+
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return trace.Wrap(err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return trace.Wrap(err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return trace.Wrap(err)
+	}
+	if err := tmp.Close(); err != nil {
+		return trace.Wrap(err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return trace.Wrap(err)
+	}
+	tmpName = "" // Success, don't remove.
+	return nil
+}
+
+func loadCreds() ([]storedCredential, error) {
+	dir, err := credsDir()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, credsFileName))
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return nil, nil
+	case err != nil:
+		return nil, trace.Wrap(err)
+	}
+
+	var creds []storedCredential
+	if err := json.Unmarshal(b, &creds); err != nil {
+		return nil, trace.Wrap(err, "failed to parse %s", filepath.Join(dir, credsFileName))
+	}
+	return creds, nil
+}
+
+func saveCreds(creds []storedCredential) error {
+	dir, err := ensureCredsDir()
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	b, err := json.MarshalIndent(creds, "", "  ")
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	return atomicWriteFile(filepath.Join(dir, credsFileName), b, 0600)
+}
+
+func keyFilePath(credentialID string) (string, error) {
+	dir, err := credsDir()
+	if err != nil {
+		return "", trace.Wrap(err)
+	}
+	return filepath.Join(dir, credentialID+".pem"), nil
+}
+
+func saveKey(credentialID string, key *ecdsa.PrivateKey) error {
+	if _, err := ensureCredsDir(); err != nil {
+		return trace.Wrap(err)
+	}
+	path, err := keyFilePath(credentialID)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: keyPEMType, Bytes: der})
+	return atomicWriteFile(path, pemBytes, 0600)
+}
+
+func loadKey(credentialID string) (*ecdsa.PrivateKey, error) {
+	path, err := keyFilePath(credentialID)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	b, err := os.ReadFile(path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return nil, ErrCredentialNotFound
+	case err != nil:
+		return nil, trace.Wrap(err)
+	}
+
+	block, _ := pem.Decode(b)
+	if block == nil || block.Type != keyPEMType {
+		return nil, fmt.Errorf("failed to decode key %q", path)
+	}
+	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	key, ok := parsed.(*ecdsa.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("unexpected key type %T in %q", parsed, path)
+	}
+	if key.Curve != elliptic.P256() {
+		return nil, fmt.Errorf("unexpected key curve %q in %q", key.Curve.Params().Name, path)
+	}
+	return key, nil
+}
+
+func deleteKey(credentialID string) error {
+	path, err := keyFilePath(credentialID)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	switch err := os.Remove(path); {
+	case errors.Is(err, os.ErrNotExist):
+		return nil
+	case err != nil:
+		return trace.Wrap(err)
+	}
+	return nil
+}
+
+func (c storedCredential) info() (*CredentialInfo, error) {
+	userHandle, err := base64.RawURLEncoding.DecodeString(c.UserHandle)
+	if err != nil {
+		return nil, trace.Wrap(err, "failed to decode user handle")
+	}
+	key, err := loadKey(c.CredentialID)
+	if err != nil {
+		return nil, trace.Wrap(err, "failed to load key")
+	}
+	return &CredentialInfo{
+		CredentialID: c.CredentialID,
+		RPID:         c.RPID,
+		User: UserInfo{
+			UserHandle: userHandle,
+			Name:       c.UserName,
+		},
+		CreateTime:   c.CreateTime,
+		publicKeyRaw: elliptic.Marshal(elliptic.P256(), key.PublicKey.X, key.PublicKey.Y),
+	}, nil
+}
+
+// Diag returns diagnostics about the Linux touchid backend.
+//
+// There is no Secure Enclave or code signature to test, so the macOS-specific
+// checks are mapped as follows:
+//   - HasCompileSupport/HasSignature: always true, this is the touchid build.
+//   - HasEntitlements: fprintd is reachable and reports a default device.
+//   - PassedLAPolicyTest: fprintd has at least one enrolled fingerprint.
+//   - PassedSecureEnclaveTest: the software key store is usable.
+func (touchIDImpl) Diag() (*DiagResult, error) {
+	res := &DiagResult{
+		HasCompileSupport: true,
+		HasSignature:      true,
+	}
+
+	if _, err := ensureCredsDir(); err != nil {
+		logger.WarnContext(context.Background(), "Touch ID credential store is not usable", "error", err)
+	} else {
+		res.PassedSecureEnclaveTest = true
+	}
+
+	dev, err := newFprintdDevice()
+	if err != nil {
+		logger.DebugContext(context.Background(), "fprintd is not available", "error", err)
+		return res, nil
+	}
+	res.HasEntitlements = true
+
+	fingers, err := dev.listEnrolledFingers()
+	if err != nil {
+		logger.DebugContext(context.Background(), "Failed to list enrolled fingerprints", "error", err)
+		return res, nil
+	}
+	if len(fingers) > 0 {
+		res.PassedLAPolicyTest = true
+	}
+
+	res.IsAvailable = res.HasEntitlements &&
+		res.PassedLAPolicyTest &&
+		res.PassedSecureEnclaveTest
+	return res, nil
+}
+
+func (touchIDImpl) NewAuthContext() AuthContext {
+	return &linuxAuthContext{}
+}
+
+func (touchIDImpl) Register(rpID, user string, userHandle []byte) (*CredentialInfo, error) {
+	if rpID == "" {
+		return nil, trace.BadParameter("rpID required")
+	}
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	credentialID := uuid.NewString()
+	if err := saveKey(credentialID, key); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	credsMu.Lock()
+	defer credsMu.Unlock()
+
+	creds, err := loadCreds()
+	if err != nil {
+		_ = deleteKey(credentialID)
+		return nil, trace.Wrap(err)
+	}
+	creds = append(creds, storedCredential{
+		CredentialID: credentialID,
+		RPID:         rpID,
+		UserName:     user,
+		UserHandle:   base64.RawURLEncoding.EncodeToString(userHandle),
+		CreateTime:   time.Now(),
+	})
+	if err := saveCreds(creds); err != nil {
+		_ = deleteKey(credentialID)
+		return nil, trace.Wrap(err)
+	}
+
+	return &CredentialInfo{
+		CredentialID: credentialID,
+		publicKeyRaw: elliptic.Marshal(elliptic.P256(), key.PublicKey.X, key.PublicKey.Y),
+	}, nil
+}
+
+func (touchIDImpl) Authenticate(actx AuthContext, credentialID string, digest []byte) ([]byte, error) {
+	// Load the key first, so a missing credential doesn't trigger a pointless
+	// fingerprint prompt.
+	key, err := loadKey(credentialID)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	switch ctx := actx.(type) {
+	case nil:
+		if err := verifyFingerprint(context.Background()); err != nil {
+			return nil, trace.Wrap(err)
+		}
+	case *linuxAuthContext:
+		if err := ctx.verify(); err != nil {
+			return nil, trace.Wrap(err)
+		}
+	default:
+		if err := verifyFingerprint(context.Background()); err != nil {
+			return nil, trace.Wrap(err)
+		}
+	}
+
+	sig, err := ecdsa.SignASN1(rand.Reader, key, digest)
+	return sig, trace.Wrap(err)
+}
+
+func (touchIDImpl) FindCredentials(rpID, user string) ([]CredentialInfo, error) {
+	credsMu.Lock()
+	defer credsMu.Unlock()
+
+	creds, err := loadCreds()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	infos := make([]CredentialInfo, 0, len(creds))
+	for _, c := range creds {
+		if c.RPID != rpID {
+			continue
+		}
+		if user != "" && c.UserName != user {
+			continue
+		}
+		info, err := c.info()
+		if err != nil {
+			logger.WarnContext(context.Background(), "Skipping credential", "credential_id", c.CredentialID, "error", err)
+			continue
+		}
+		infos = append(infos, *info)
+	}
+	return infos, nil
+}
+
+func (touchIDImpl) ListCredentials() ([]CredentialInfo, error) {
+	// Match macOS semantics: listing requires user interaction (the fprintd
+	// prompt), even though the metadata itself is a regular user-owned file.
+	if err := verifyFingerprint(context.Background()); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	credsMu.Lock()
+	defer credsMu.Unlock()
+
+	creds, err := loadCreds()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	infos := make([]CredentialInfo, 0, len(creds))
+	for _, c := range creds {
+		info, err := c.info()
+		if err != nil {
+			logger.WarnContext(context.Background(), "Skipping credential", "credential_id", c.CredentialID, "error", err)
+			continue
+		}
+		infos = append(infos, *info)
+	}
+	return infos, nil
+}
+
+func (touchIDImpl) DeleteCredential(credentialID string) error {
+	// Match macOS semantics: deletion requires user interaction.
+	if err := verifyFingerprint(context.Background()); err != nil {
+		return trace.Wrap(err)
+	}
+	return touchIDImpl{}.DeleteNonInteractive(credentialID)
+}
+
+func (touchIDImpl) DeleteNonInteractive(credentialID string) error {
+	if credentialID == "" {
+		return trace.BadParameter("credentialID required")
+	}
+
+	credsMu.Lock()
+	defer credsMu.Unlock()
+
+	creds, err := loadCreds()
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	found := false
+	remaining := creds[:0]
+	for _, c := range creds {
+		if c.CredentialID == credentialID {
+			found = true
+			continue
+		}
+		remaining = append(remaining, c)
+	}
+	if !found {
+		return ErrCredentialNotFound
+	}
+	if err := saveCreds(remaining); err != nil {
+		return trace.Wrap(err)
+	}
+	return deleteKey(credentialID)
+}
+
+// linuxAuthContext is the Linux AuthContext implementation.
+//
+// A successful fingerprint verification is remembered for
+// fingerprintReuseWindow, mirroring the short reuse window of macOS LAContext.
+type linuxAuthContext struct {
+	mu         sync.Mutex
+	verifiedAt time.Time
+	closed     bool
+}
+
+func (c *linuxAuthContext) Guard(fn func()) error {
+	if err := c.verify(); err != nil {
+		return trace.Wrap(err)
+	}
+	fn()
+	return nil
+}
+
+func (c *linuxAuthContext) Close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closed = true
+}
+
+func (c *linuxAuthContext) verify() error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return errors.New("authentication context is closed")
+	}
+	if time.Since(c.verifiedAt) < fingerprintReuseWindow {
+		c.mu.Unlock()
+		return nil
+	}
+	c.mu.Unlock()
+
+	// Don't hold the lock while prompting, so concurrent Guards don't serialize
+	// behind a multi-second fingerprint prompt.
+	if err := verifyFingerprint(context.Background()); err != nil {
+		return trace.Wrap(err)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.verifiedAt.IsZero() || time.Since(c.verifiedAt) >= fingerprintReuseWindow {
+		c.verifiedAt = time.Now()
+	}
+	return nil
+}
+
+// fprintdDevice is a handle to an fprintd D-Bus device.
+type fprintdDevice struct {
+	conn *dbus.Conn
+	path dbus.ObjectPath
+	name string
+}
+
+func newFprintdDevice() (*fprintdDevice, error) {
+	conn, err := dbus.SystemBus()
+	if err != nil {
+		return nil, trace.Wrap(err, "failed to connect to the D-Bus system bus")
+	}
+
+	mgr := conn.Object(fprintdBusName, fprintdManagerPath)
+	var path dbus.ObjectPath
+	if err := mgr.Call(fprintdManagerIface+".GetDefaultDevice", 0).Store(&path); err != nil {
+		return nil, trace.Wrap(err, "failed to get the default fingerprint device")
+	}
+	if path == "" || path == "/" {
+		return nil, errors.New("no fingerprint device found")
+	}
+
+	dev := conn.Object(fprintdBusName, path)
+	var props map[string]dbus.Variant
+	if err := dev.Call("org.freedesktop.DBus.Properties.GetAll", 0, fprintdDeviceIface).Store(&props); err != nil {
+		return nil, trace.Wrap(err, "failed to get fingerprint device properties")
+	}
+	name, _ := props["name"].Value().(string)
+
+	return &fprintdDevice{
+		conn: conn,
+		path: path,
+		name: name,
+	}, nil
+}
+
+// usernameArg returns the username argument for fprintd calls.
+//
+// A non-root caller passes an empty string, which fprintd maps to the caller's
+// session user without requiring the "setusername" polkit action. Root must be
+// explicit, since it has no prints of its own.
+func usernameArg() string {
+	if os.Geteuid() != 0 {
+		return ""
+	}
+	u, err := user.Current()
+	if err != nil {
+		return ""
+	}
+	return u.Username
+}
+
+func (d *fprintdDevice) listEnrolledFingers() ([]string, error) {
+	call := d.conn.Object(fprintdBusName, d.path).Call(fprintdDeviceIface+".ListEnrolledFingers", 0, usernameArg())
+	if call.Err != nil {
+		return nil, trace.Wrap(call.Err)
+	}
+	var fingers []string
+	if err := call.Store(&fingers); err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return fingers, nil
+}
+
+// errFingerprintDevice is a transient capture failure, worth retrying.
+var errFingerprintDevice = errors.New("fingerprint device error")
+
+// fprintdMu serializes fingerprint verifications within the process.
+var fprintdMu sync.Mutex
+
+// verify asks the user for a fingerprint and blocks until the verification
+// succeeds, fails or times out.
+func (d *fprintdDevice) verify(ctx context.Context) error {
+	fprintdMu.Lock()
+	defer fprintdMu.Unlock()
+
+	obj := d.conn.Object(fprintdBusName, d.path)
+	if err := obj.Call(fprintdDeviceIface+".Claim", 0, usernameArg()).Err; err != nil {
+		return trace.Wrap(err, "failed to claim the fingerprint device")
+	}
+	defer func() {
+		if err := obj.Call(fprintdDeviceIface+".Release", 0).Err; err != nil {
+			logger.DebugContext(ctx, "Failed to release the fingerprint device", "error", err)
+		}
+	}()
+
+	// Subscribe to signals before starting the verification, otherwise the
+	// first status can be missed.
+	sigs := make(chan *dbus.Signal, 16)
+	d.conn.Signal(sigs)
+	defer d.conn.RemoveSignal(sigs)
+
+	matchOpts := []dbus.MatchOption{
+		dbus.WithMatchObjectPath(d.path),
+		dbus.WithMatchInterface(fprintdDeviceIface),
+	}
+	if err := d.conn.AddMatchSignal(matchOpts...); err != nil {
+		return trace.Wrap(err, "failed to subscribe to fprintd signals")
+	}
+	defer func() {
+		if err := d.conn.RemoveMatchSignal(matchOpts...); err != nil {
+			logger.DebugContext(ctx, "Failed to remove fprintd match rule", "error", err)
+		}
+	}()
+
+	deadline := time.Now().Add(fingerprintVerifyTimeout)
+	var lastErr error
+	for attempt := 1; attempt <= fingerprintVerifyAttempts; attempt++ {
+		// Drop any status left over from a previous attempt.
+		for draining := true; draining; {
+			select {
+			case <-sigs:
+			default:
+				draining = false
+			}
+		}
+
+		logger.DebugContext(ctx, "Prompting for fingerprint", "device", d.name, "attempt", attempt)
+		if err := obj.Call(fprintdDeviceIface+".VerifyStart", 0, "any").Err; err != nil {
+			return trace.Wrap(err, "failed to start fingerprint verification")
+		}
+
+		err := waitVerifyStatus(ctx, sigs, d.path, deadline)
+		if stopErr := obj.Call(fprintdDeviceIface+".VerifyStop", 0).Err; stopErr != nil {
+			logger.DebugContext(ctx, "Failed to stop fingerprint verification", "error", stopErr)
+		}
+
+		switch {
+		case err == nil:
+			return nil
+		case errors.Is(err, errFingerprintDevice) && attempt < fingerprintVerifyAttempts:
+			logger.DebugContext(ctx, "Fingerprint capture failed, retrying", "attempt", attempt, "error", err)
+			lastErr = err
+			continue
+		default:
+			return err
+		}
+	}
+	return lastErr
+}
+
+// waitVerifyStatus waits for a terminal VerifyStatus signal.
+func waitVerifyStatus(ctx context.Context, sigs <-chan *dbus.Signal, path dbus.ObjectPath, deadline time.Time) error {
+	timeout := time.Until(deadline)
+	if timeout <= 0 {
+		return errors.New("timed out waiting for a fingerprint")
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case sig, ok := <-sigs:
+			if !ok {
+				return errors.New("fprintd signal channel closed")
+			}
+			if sig.Path != path || sig.Name != fprintdDeviceIface+".VerifyStatus" || len(sig.Body) == 0 {
+				continue
+			}
+			status, _ := sig.Body[0].(string)
+			switch status {
+			case "verify-match":
+				return nil
+			case "verify-no-match":
+				return errors.New("fingerprint does not match")
+			case "verify-disconnected":
+				return errors.New("fingerprint device disconnected")
+			case "verify-unknown-error":
+				return errFingerprintDevice
+			default:
+				// Retry statuses (verify-retry-scan, verify-swipe-too-short,
+				// verify-finger-not-centered, verify-remove-and-retry,
+				// verify-too-fast) mean the verification is still ongoing.
+				logger.DebugContext(ctx, "Fingerprint verification status", "status", status)
+			}
+		case <-timer.C:
+			return errors.New("timed out waiting for a fingerprint")
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func verifyFingerprint(ctx context.Context) error {
+	dev, err := newFprintdDevice()
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	return dev.verify(ctx)
+}

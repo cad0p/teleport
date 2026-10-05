@@ -1,5 +1,5 @@
-//go:build touchid
-// +build touchid
+//go:build touchid && darwin
+// +build touchid,darwin
 
 /*
  * Teleport
