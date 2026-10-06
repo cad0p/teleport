@@ -2435,6 +2435,11 @@ func onLogin(cf *CLIConf, reExecArgs ...string) (err error) {
 		return trace.Wrap(err)
 	}
 
+	// Local fork patch (integration/i3-headless-mfa): allow headless
+	// (browser-approved) login for the login command so the resulting
+	// certificate can be persisted (--out identity file / profile).
+	tc.AllowHeadless = true
+
 	// On successful login, try to remove the tsh proxy ssh lockfile.
 	// This is just a safeguard in case a tsh process somehow hangs while
 	// holding the lock.
