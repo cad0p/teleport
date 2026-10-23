@@ -26,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -303,7 +304,8 @@ func TestDescribeRequesterSelf(t *testing.T) {
 	require.NoError(t, err)
 	got := describeRequester(fd)
 	assert.Contains(t, got, "(pid "+strconv.Itoa(os.Getpid())+")")
-	assert.Contains(t, got, filepath.Base(exe))
+	assert.True(t, strings.HasPrefix(got, sanitizeForDialog(filepath.Base(exe), 40)+" (pid "), "dialog text must lead with the executable name: %q", got)
+	assert.NotContains(t, got, "/", "the directory is logged, not shown")
 	assert.Equal(t, "an unidentified process", describeRequester(-1))
 }
 

@@ -41,6 +41,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -292,7 +293,10 @@ func describeRequester(pidfd int) string {
 	if err := unix.PidfdSendSignal(pidfd, 0, nil, 0); err != nil {
 		return unknown
 	}
-	return fmt.Sprintf("%s (pid %d)", sanitizeForDialog(exe, 60), pid)
+	// The dialog is one elided line: lead with the executable's name, which is
+	// what identifies the requester, and log the full path for the record.
+	logger.InfoContext(context.Background(), "Presence requested", "pid", pid, "exe", exe)
+	return fmt.Sprintf("%s (pid %d)", sanitizeForDialog(filepath.Base(exe), 40), pid)
 }
 
 // pidFromPIDFD reads the pid a pidfd refers to from /proc/self/fdinfo.
