@@ -231,9 +231,10 @@ func polkitCheckWith(ctx context.Context, authority polkitAuthority, peer Presen
 	}
 
 	// polkit.message is honoured for uid 0 callers (the helper runs as root),
-	// so the dialog names the process asking.
+	// so the dialog names the process asking. The Omarchy dialog shows it on
+	// one line and elides the middle when too wide, so it stays short.
 	details := map[string]string{
-		"polkit.message": "Teleport Touch ID requested by " + requester + ". Confirm with your fingerprint or password.",
+		"polkit.message": "Teleport Touch ID for " + requester,
 	}
 	ctx, cancel := context.WithTimeout(ctx, polkitPromptTimeout)
 	defer cancel()
@@ -291,7 +292,7 @@ func describeRequester(pidfd int) string {
 	if err := unix.PidfdSendSignal(pidfd, 0, nil, 0); err != nil {
 		return unknown
 	}
-	return fmt.Sprintf("%s (pid %d)", sanitizeForDialog(exe, 160), pid)
+	return fmt.Sprintf("%s (pid %d)", sanitizeForDialog(exe, 60), pid)
 }
 
 // pidFromPIDFD reads the pid a pidfd refers to from /proc/self/fdinfo.
