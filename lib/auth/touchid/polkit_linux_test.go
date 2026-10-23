@@ -303,10 +303,34 @@ func TestDescribeRequesterSelf(t *testing.T) {
 	exe, err := os.Executable()
 	require.NoError(t, err)
 	got := describeRequester(fd)
-	assert.Contains(t, got, "(pid "+strconv.Itoa(os.Getpid())+")")
-	assert.True(t, strings.HasPrefix(got, sanitizeForDialog(filepath.Base(exe), 40)+" (pid "), "dialog text must lead with the executable name: %q", got)
-	assert.NotContains(t, got, "/", "the directory is logged, not shown")
+	// argv[0] is replaced by the real executable's basename, then the args.
+	assert.True(t, strings.HasPrefix(got, filepath.Base(exe)+" -test."), "dialog text must be the command line: %q", got)
+	assert.NotContains(t, strings.Fields(got)[0], "/", "the directory is logged, not shown")
+	assert.LessOrEqual(t, len(got), requesterCommandMax+len("… (+99999 chars)"))
 	assert.Equal(t, "an unidentified process", describeRequester(-1))
+}
+
+func TestCommandForDialog(t *testing.T) {
+	assert.Equal(t, "tsh ssh admin@pcad-it", commandForDialog("tsh ssh admin@pcad-it", 60))
+	assert.Equal(t, "tsh ssh a?b", commandForDialog("tsh ssh a\nb", 60))
+	assert.Equal(t, "tsh s… (+16 chars)", commandForDialog("tsh ssh admin@pcad-it", 5))
+}
+
+func TestPresenceMessage(t *testing.T) {
+	assert.Equal(t, "Teleport Touch ID for teleport-admin@teleport.pcad.it · tsh ssh admin@pcad-it",
+		presenceMessage("teleport-admin@teleport.pcad.it", "tsh ssh admin@pcad-it"))
+	assert.Equal(t, "Teleport Touch ID · tsh touchid ls", presenceMessage("", "tsh touchid ls"))
+	assert.Equal(t, "Teleport Touch ID for a?b · x", presenceMessage("a\nb", "x"))
+}
+
+func TestPolkitMessageCarriesReason(t *testing.T) {
+	f := &fakeAuthority{probe: polkitAuthResult{IsChallenge: true}, interactive: polkitAuthResult{IsAuthorized: true}}
+	peer := PresencePeer{UID: 1001, PIDFD: 9, Reason: "teleport-admin@teleport.pcad.it"}
+	_, err := polkitCheckWith(context.Background(), f, peer, "tsh ssh admin@pcad-it")
+	require.NoError(t, err)
+	require.Len(t, f.calls, 2)
+	assert.Equal(t, "Teleport Touch ID for teleport-admin@teleport.pcad.it · tsh ssh admin@pcad-it", f.calls[1].details["polkit.message"])
+	assert.Empty(t, f.calls[0].details, "the probe carries no details")
 }
 
 func TestPresenceFailureIsNotCached(t *testing.T) {
@@ -353,7 +377,9 @@ func TestAuthContextBoundToCreatorUID(t *testing.T) {
 	_, err = srv.dispatch(alice, &helperRequest{Method: helperMethodAuthContextGuard, Params: params})
 	require.NoError(t, err)
 	assert.Equal(t, 1, f.polkitCalls)
-	assert.Equal(t, alice, f.lastPeer)
+	want := alice
+	want.Reason = "choosing a Teleport user"
+	assert.Equal(t, want, f.lastPeer)
 }
 
 func itoa(i int) string { return strconv.Itoa(i) }

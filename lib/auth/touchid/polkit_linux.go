@@ -32,9 +32,15 @@ package touchid
 // that process (no pidfd, no agent, an inactive or remote session, a local rule
 // that grants the action without authentication, polkit unreachable before the
 // dialog). Once a dialog has been shown, a cancel, failed attempts or no answer
-// is a failure, not a fallback. The dialog names the requesting executable and
-// pid; any process of an allowed uid can connect to the helper, so the name is
-// what lets the user tell a tsh request from anything else.
+// is a failure, not a fallback.
+//
+// The dialog says "Teleport Touch ID for <user>@<cluster> · <command>". The
+// "<user>@<cluster>" part comes from the root-owned credential store entry the
+// request would sign with, so the client cannot change it. The command is the
+// requester's argv with argv[0] replaced by its real executable's basename: any
+// process of an allowed uid can connect, and it controls its own argv, so the
+// command says what the requester claims to be doing, not proof that it is
+// tsh. The full executable path and command line are logged.
 
 import (
 	"context"
@@ -76,9 +82,14 @@ const (
 // connection. UID comes from SO_PEERCRED. PIDFD is a pidfd for the peer
 // (SO_PEERPIDFD), or -1 when none is available; without a pidfd the polkit
 // path is skipped, because a bare pid can be recycled before polkit reads it.
+//
+// Reason says what the presence is for, for the dialog text. signService sets
+// it from the root-owned credential store (e.g. "teleport-admin@teleport.pcad.it"),
+// never from the client's request, so it is the trustworthy part of the text.
 type PresencePeer struct {
-	UID   uint32
-	PIDFD int
+	UID    uint32
+	PIDFD  int
+	Reason string
 }
 
 // polkitOutcome is the result of an interactive polkit check.
@@ -199,6 +210,16 @@ func polkitCheckDBus(ctx context.Context, peer PresencePeer) (polkitOutcome, err
 	return polkitCheckWith(ctx, dbusPolkitAuthority{obj: conn.Object(polkitBusName, polkitAuthorityPath)}, peer, describeRequester(peer.PIDFD))
 }
 
+// presenceMessage is the dialog text: what the presence is for (from the
+// store), then the requesting command (from /proc; the caller controls its
+// argv, so it comes second and is cut explicitly).
+func presenceMessage(reason, requester string) string {
+	if reason == "" {
+		return "Teleport Touch ID · " + requester
+	}
+	return "Teleport Touch ID for " + sanitizeForDialog(reason, 80) + " · " + requester
+}
+
 // polkitCheckWith runs the probe and the interactive check against authority.
 // requester describes the peer process for the dialog text.
 func polkitCheckWith(ctx context.Context, authority polkitAuthority, peer PresencePeer, requester string) (polkitOutcome, error) {
@@ -232,10 +253,11 @@ func polkitCheckWith(ctx context.Context, authority polkitAuthority, peer Presen
 	}
 
 	// polkit.message is honoured for uid 0 callers (the helper runs as root),
-	// so the dialog names the process asking. The Omarchy dialog shows it on
-	// one line and elides the middle when too wide, so it stays short.
+	// so the dialog says which Teleport user/cluster and which command asks.
+	// The Omarchy dialog shows it on one line and elides the middle when too
+	// wide, so each part is bounded with an explicit cut marker.
 	details := map[string]string{
-		"polkit.message": "Teleport Touch ID for " + requester,
+		"polkit.message": presenceMessage(peer.Reason, requester),
 	}
 	ctx, cancel := context.WithTimeout(ctx, polkitPromptTimeout)
 	defer cancel()
@@ -274,10 +296,16 @@ func (a dbusPolkitAuthority) cancelCheckAuthorization(ctx context.Context, cance
 	return trace.Wrap(a.obj.CallWithContext(ctx, polkitAuthorityIface+".CancelCheckAuthorization", 0, cancellationID).Err)
 }
 
+// requesterCommandMax bounds the command shown in the dialog.
+const requesterCommandMax = 60
+
 // describeRequester names the process behind pidfd for the dialog: its
-// executable path and pid, read from /proc and confirmed against the pidfd
-// afterwards so a recycled pid is never named. It never fails; an unknown
-// process is described as such.
+// command line, with argv[0] replaced by the basename of the real executable
+// (/proc/<pid>/exe), read from /proc and confirmed against the pidfd
+// afterwards so a recycled pid is never named. The arguments are the caller's
+// own argv, so they say what the caller claims to be doing, not what it is;
+// the full executable path and command line are logged. It never fails; an
+// unknown process is described as such.
 func describeRequester(pidfd int) string {
 	const unknown = "an unidentified process"
 	pid, err := pidFromPIDFD(pidfd)
@@ -288,15 +316,30 @@ func describeRequester(pidfd int) string {
 	if err != nil {
 		return unknown
 	}
-	// The pidfd still refers to a live process with this pid: the /proc read
-	// above was about the peer, not a successor.
+	rawArgs, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return unknown
+	}
+	// The pidfd still refers to a live process with this pid: the /proc reads
+	// above were about the peer, not a successor.
 	if err := unix.PidfdSendSignal(pidfd, 0, nil, 0); err != nil {
 		return unknown
 	}
-	// The dialog is one elided line: lead with the executable's name, which is
-	// what identifies the requester, and log the full path for the record.
-	logger.InfoContext(context.Background(), "Presence requested", "pid", pid, "exe", exe)
-	return fmt.Sprintf("%s (pid %d)", sanitizeForDialog(filepath.Base(exe), 40), pid)
+	args := strings.Split(strings.TrimRight(string(rawArgs), "\x00"), "\x00")
+	words := append([]string{filepath.Base(exe)}, args[1:]...)
+	cmd := strings.Join(words, " ")
+	logger.InfoContext(context.Background(), "Presence requested", "pid", pid, "exe", exe, "cmdline", strings.Join(args, " "))
+	return commandForDialog(cmd, requesterCommandMax)
+}
+
+// commandForDialog sanitizes cmd and, when it is longer than max, cuts it with
+// an explicit marker saying how much was left out.
+func commandForDialog(cmd string, max int) string {
+	clean := sanitizeForDialog(cmd, len(cmd))
+	if len(clean) <= max {
+		return clean
+	}
+	return fmt.Sprintf("%s… (+%d chars)", clean[:max], len(clean)-max)
 }
 
 // pidFromPIDFD reads the pid a pidfd refers to from /proc/self/fdinfo.

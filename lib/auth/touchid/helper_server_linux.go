@@ -227,6 +227,7 @@ func (s *HelperServer) dispatch(peer PresencePeer, req *helperRequest) (any, err
 		if err := s.checkContextOwner(params.ContextID, uid); err != nil {
 			return nil, trace.Wrap(err)
 		}
+		peer.Reason = "choosing a Teleport user"
 		return nil, trace.Wrap(s.svc.ensureVerified(peer))
 
 	case helperMethodAuthContextClose:

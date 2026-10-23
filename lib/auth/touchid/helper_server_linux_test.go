@@ -31,6 +31,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/gravitational/trace"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -167,6 +168,45 @@ func TestHelperAuthenticateSignsAndReusesPresence(t *testing.T) {
 	_, err = h.Authenticate(nil, info.CredentialID, digest[:])
 	require.NoError(t, err)
 	assert.Equal(t, int32(1), atomic.LoadInt32(calls))
+}
+
+// TestPresenceReasonFromStore pins that the dialog's "for <user>@<rp id>" comes
+// from the root-owned store entry of the credential being used, and that an
+// unknown credential is refused before any prompt.
+func TestPresenceReasonFromStore(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	prevSeal, prevUnseal := sealKeyMaterial, unsealKeyMaterial
+	sealKeyMaterial = func(scalar []byte) ([]byte, error) { return append([]byte(nil), scalar...), nil }
+	unsealKeyMaterial = func(blob []byte) ([]byte, error) { return append([]byte(nil), blob...), nil }
+	t.Cleanup(func() { sealKeyMaterial, unsealKeyMaterial = prevSeal, prevUnseal })
+
+	var reasons []string
+	prev := verifyPresence
+	verifyPresence = func(_ context.Context, p PresencePeer) error {
+		reasons = append(reasons, p.Reason)
+		return nil
+	}
+	t.Cleanup(func() { verifyPresence = prev })
+
+	info, err := registerCredential("teleport.pcad.it", "teleport-admin", []byte("h"))
+	require.NoError(t, err)
+	digest := sha256.Sum256([]byte("x"))
+
+	svc := newSignService()
+	_, err = svc.authenticate(PresencePeer{UID: 1001, PIDFD: -1}, "no-such-credential", digest[:])
+	require.True(t, trace.IsNotFound(err), "unknown credential: %v", err)
+	assert.Empty(t, reasons, "an unknown credential must not prompt")
+
+	_, err = svc.authenticate(PresencePeer{UID: 1001, PIDFD: -1}, info.CredentialID, digest[:])
+	require.NoError(t, err)
+	require.NoError(t, svc.deleteCredential(PresencePeer{UID: 1002, PIDFD: -1}, info.CredentialID))
+	_, err = svc.listCredentials(PresencePeer{UID: 1003, PIDFD: -1})
+	require.NoError(t, err)
+	assert.Equal(t, []string{
+		"teleport-admin@teleport.pcad.it",
+		"deleting teleport-admin@teleport.pcad.it",
+		"listing Touch ID credentials",
+	}, reasons)
 }
 
 func TestHelperAuthContext(t *testing.T) {

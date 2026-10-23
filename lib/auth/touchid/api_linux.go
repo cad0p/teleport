@@ -646,7 +646,29 @@ func (s *signService) authContextUID(contextID int) (uint32, bool) {
 	return uid, ok
 }
 
+// credentialLabel names a stored credential as "<user>@<rp id>" for the
+// presence dialog. It fails for an unknown credential, before any prompt.
+func credentialLabel(credentialID string) (string, error) {
+	credsMu.Lock()
+	defer credsMu.Unlock()
+	creds, err := loadCreds()
+	if err != nil {
+		return "", trace.Wrap(err)
+	}
+	for _, c := range creds {
+		if c.CredentialID == credentialID {
+			return c.UserName + "@" + c.RPID, nil
+		}
+	}
+	return "", trace.NotFound("credential %q not found", credentialID)
+}
+
 func (s *signService) authenticate(peer PresencePeer, credentialID string, digest []byte) ([]byte, error) {
+	label, err := credentialLabel(credentialID)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	peer.Reason = label
 	if err := s.ensureVerified(peer); err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -656,6 +678,7 @@ func (s *signService) authenticate(peer PresencePeer, credentialID string, diges
 func (s *signService) listCredentials(peer PresencePeer) ([]CredentialInfo, error) {
 	// Match macOS semantics: listing requires user interaction (the presence
 	// prompt), even though the metadata itself is a regular user-owned file.
+	peer.Reason = "listing Touch ID credentials"
 	if err := s.ensureVerified(peer); err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -664,6 +687,11 @@ func (s *signService) listCredentials(peer PresencePeer) ([]CredentialInfo, erro
 
 func (s *signService) deleteCredential(peer PresencePeer, credentialID string) error {
 	// Match macOS semantics: deletion requires user interaction.
+	label, err := credentialLabel(credentialID)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	peer.Reason = "deleting " + label
 	if err := s.ensureVerified(peer); err != nil {
 		return trace.Wrap(err)
 	}
