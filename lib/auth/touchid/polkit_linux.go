@@ -27,21 +27,28 @@ package touchid
 // the quickshell agent, whose PAM stack accepts a fingerprint or the account
 // password — the same "Touch ID or password" choice macOS LAContext offers).
 //
-// The helper therefore asks polkit first, for the connecting tsh process, and
-// only falls back to the bare fprintd check when polkit cannot run an
-// interactive check for that process (no agent, an inactive or remote session,
-// polkit unreachable). An explicit cancel in the dialog, or an unanswered
-// dialog, is a failure, not a fallback.
+// The helper therefore asks polkit first, for the connecting process, and only
+// falls back to the bare fprintd check when polkit cannot show a dialog for
+// that process (no pidfd, no agent, an inactive or remote session, a local rule
+// that grants the action without authentication, polkit unreachable before the
+// dialog). Once a dialog has been shown, a cancel, failed attempts or no answer
+// is a failure, not a fallback. The dialog names the requesting executable and
+// pid; any process of an allowed uid can connect to the helper, so the name is
+// what lets the user tell a tsh request from anything else.
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/godbus/dbus/v5"
 	"github.com/gravitational/trace"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -59,6 +66,9 @@ const (
 
 	// polkitPromptTimeout bounds how long the dialog may stay unanswered.
 	polkitPromptTimeout = 60 * time.Second
+	// polkitProbeTimeout bounds the non-interactive calls (the probe and the
+	// cancel).
+	polkitProbeTimeout = 5 * time.Second
 )
 
 // PresencePeer identifies the process on the other end of a helper
@@ -74,18 +84,26 @@ type PresencePeer struct {
 type polkitOutcome int
 
 const (
-	// polkitUnavailable: polkit could not run an interactive check for the
-	// subject (no agent, inactive/remote session, D-Bus failure, not
-	// authorized without a user decision). The caller falls back to fprintd.
+	// polkitUnavailable: polkit could not show a dialog for the subject (no
+	// pidfd, inactive or remote session, no authentication agent, an action
+	// auto-granted by a local rule, polkit unreachable). No dialog was shown,
+	// and the caller falls back to fprintd.
 	polkitUnavailable polkitOutcome = iota
 	// polkitAuthorized: the user authenticated in the dialog.
 	polkitAuthorized
 	// polkitDismissed: the user cancelled the dialog.
 	polkitDismissed
+	// polkitFailed: a dialog was shown and the user did not authenticate
+	// (failed attempts). Like a cancel, this is final.
+	polkitFailed
 )
 
 // errPresenceCancelled is returned when the user dismisses the polkit dialog.
 var errPresenceCancelled = errors.New("user presence check cancelled in the authentication dialog")
+
+// errPresenceFailed is returned when the user fails to authenticate in the
+// polkit dialog.
+var errPresenceFailed = errors.New("user presence check failed in the authentication dialog")
 
 // polkitCheck runs the interactive polkit check. It is a package variable so
 // tests can substitute a fake.
@@ -96,8 +114,11 @@ var polkitCheck = polkitCheckDBus
 var fingerprintCheck = verifyFingerprint
 
 // verifyPolkitOrFingerprint is the default user-presence check: the polkit
-// dialog when the peer can be identified and polkit can interact with the
-// user, the fprintd check otherwise. It fails closed.
+// dialog when the peer can be identified and polkit can show a dialog for it,
+// the fprintd check otherwise. Once a dialog has been shown, its answer is
+// final: a cancel, failed attempts or no answer within polkitPromptTimeout
+// fail the check without starting a second, invisible fingerprint prompt.
+// Every path either confirms presence or returns an error.
 func verifyPolkitOrFingerprint(ctx context.Context, peer PresencePeer) error {
 	if peer.PIDFD >= 0 {
 		outcome, err := polkitCheck(ctx, peer)
@@ -109,17 +130,14 @@ func verifyPolkitOrFingerprint(ctx context.Context, peer PresencePeer) error {
 			}
 			return nil
 		case polkitDismissed:
-			if err != nil {
-				return trace.Wrap(err)
-			}
 			return trace.Wrap(errPresenceCancelled)
-		default:
-			if err != nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
-				// The dialog was shown and not answered: do not start a second,
-				// invisible prompt.
-				return trace.Wrap(err, "authentication dialog not answered")
+		case polkitFailed:
+			if err != nil {
+				return trace.Wrap(err, "%s", errPresenceFailed)
 			}
-			logger.InfoContext(ctx, "polkit presence check unavailable, falling back to fprintd", "uid", peer.UID, "error", err)
+			return trace.Wrap(errPresenceFailed)
+		default:
+			logger.InfoContext(ctx, "polkit cannot show a presence dialog, falling back to fprintd", "uid", peer.UID, "error", err)
 		}
 	}
 	return trace.Wrap(fingerprintCheck(ctx, peer.UID))
@@ -138,17 +156,31 @@ type polkitAuthResult struct {
 	Details      map[string]string
 }
 
+// polkitAuthority is the subset of org.freedesktop.PolicyKit1.Authority the
+// presence check uses. It is an interface so the probe/prompt/cancel logic can
+// be tested without a system bus.
+type polkitAuthority interface {
+	checkAuthorization(ctx context.Context, subject polkitSubject, details map[string]string, flags uint32, cancellationID string) (polkitAuthResult, error)
+	cancelCheckAuthorization(ctx context.Context, cancellationID string) error
+}
+
 var polkitCancellationSeq atomic.Uint64
 
-// classifyPolkitResult maps a CheckAuthorization result to an outcome.
-func classifyPolkitResult(res polkitAuthResult) polkitOutcome {
+// classifyInteractiveResult maps the result of the interactive
+// CheckAuthorization call to an outcome. polkit answers "challenge" to an
+// interactive call only when it has no authentication agent for the subject's
+// session (pkcheck reports that as "no agent is available"); that is the one
+// interactive answer after which no dialog was shown.
+func classifyInteractiveResult(res polkitAuthResult) polkitOutcome {
 	switch {
 	case res.IsAuthorized:
 		return polkitAuthorized
 	case res.Details["polkit.dismissed"] != "":
 		return polkitDismissed
-	default:
+	case res.IsChallenge:
 		return polkitUnavailable
+	default:
+		return polkitFailed
 	}
 }
 
@@ -163,11 +195,12 @@ func polkitCheckDBus(ctx context.Context, peer PresencePeer) (polkitOutcome, err
 	if !conn.SupportsUnixFDs() {
 		return polkitUnavailable, trace.BadParameter("system bus connection does not support fd passing")
 	}
+	return polkitCheckWith(ctx, dbusPolkitAuthority{obj: conn.Object(polkitBusName, polkitAuthorityPath)}, peer, describeRequester(peer.PIDFD))
+}
 
-	ctx, cancel := context.WithTimeout(ctx, polkitPromptTimeout)
-	defer cancel()
-
-	cancellationID := fmt.Sprintf("tsh-touchid-%d", polkitCancellationSeq.Add(1))
+// polkitCheckWith runs the probe and the interactive check against authority.
+// requester describes the peer process for the dialog text.
+func polkitCheckWith(ctx context.Context, authority polkitAuthority, peer PresencePeer, requester string) (polkitOutcome, error) {
 	subject := polkitSubject{
 		Kind: "unix-process",
 		Details: map[string]dbus.Variant{
@@ -176,17 +209,16 @@ func polkitCheckDBus(ctx context.Context, peer PresencePeer) (polkitOutcome, err
 			"uid": dbus.MakeVariant(int32(peer.UID)),
 		},
 	}
-	authority := conn.Object(polkitBusName, polkitAuthorityPath)
 
 	// Probe without interaction first. The action is auth_self for active
 	// sessions, so a correct setup answers "challenge". An immediate "yes"
 	// means a local polkit rule grants the action outright, which would turn
-	// the presence check into a no-op: refuse to treat that as presence and
-	// let the caller fall back to the fingerprint.
-	var probe polkitAuthResult
-	if err := authority.CallWithContext(ctx, polkitAuthorityIface+".CheckAuthorization", 0,
-		subject, PolkitPresenceAction, map[string]string{}, uint32(0), "",
-	).Store(&probe); err != nil {
+	// the dialog into a no-op: refuse it as presence (the fingerprint check
+	// then decides).
+	probeCtx, cancelProbe := context.WithTimeout(ctx, polkitProbeTimeout)
+	probe, err := authority.checkAuthorization(probeCtx, subject, map[string]string{}, 0, "")
+	cancelProbe()
+	if err != nil {
 		return polkitUnavailable, trace.Wrap(err, "polkit CheckAuthorization (probe)")
 	}
 	switch {
@@ -198,17 +230,99 @@ func polkitCheckDBus(ctx context.Context, peer PresencePeer) (polkitOutcome, err
 		return polkitUnavailable, trace.NotFound("polkit cannot prompt for this process (inactive or remote session)")
 	}
 
-	var res polkitAuthResult
-	err = authority.CallWithContext(ctx, polkitAuthorityIface+".CheckAuthorization", 0,
-		subject, PolkitPresenceAction, map[string]string{}, polkitCheckAllowUserInteraction, cancellationID,
-	).Store(&res)
+	// polkit.message is honoured for uid 0 callers (the helper runs as root),
+	// so the dialog names the process asking.
+	details := map[string]string{
+		"polkit.message": "Teleport Touch ID requested by " + requester + ". Confirm with your fingerprint or password.",
+	}
+	ctx, cancel := context.WithTimeout(ctx, polkitPromptTimeout)
+	defer cancel()
+	cancellationID := fmt.Sprintf("tsh-touchid-%d", polkitCancellationSeq.Add(1))
+	res, err := authority.checkAuthorization(ctx, subject, details, polkitCheckAllowUserInteraction, cancellationID)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			// Close the dialog the agent may still be showing.
-			_ = authority.Call(polkitAuthorityIface+".CancelCheckAuthorization", 0, cancellationID).Err
-			return polkitUnavailable, trace.Wrap(ctxErr)
+			// The dialog was shown and not answered. Close it, and fail: no
+			// second, invisible prompt.
+			cancelCtx, cancelCancel := context.WithTimeout(context.Background(), polkitProbeTimeout)
+			_ = authority.cancelCheckAuthorization(cancelCtx, cancellationID)
+			cancelCancel()
+			return polkitFailed, trace.Wrap(ctxErr, "authentication dialog not answered")
 		}
-		return polkitUnavailable, trace.Wrap(err, "polkit CheckAuthorization")
+		// The call failed without an answer from the user; polkit may or may
+		// not have shown a dialog. Fail rather than risk a second prompt.
+		return polkitFailed, trace.Wrap(err, "polkit CheckAuthorization")
 	}
-	return classifyPolkitResult(res), nil
+	return classifyInteractiveResult(res), nil
+}
+
+// dbusPolkitAuthority implements polkitAuthority over D-Bus.
+type dbusPolkitAuthority struct {
+	obj dbus.BusObject
+}
+
+func (a dbusPolkitAuthority) checkAuthorization(ctx context.Context, subject polkitSubject, details map[string]string, flags uint32, cancellationID string) (polkitAuthResult, error) {
+	var res polkitAuthResult
+	err := a.obj.CallWithContext(ctx, polkitAuthorityIface+".CheckAuthorization", 0,
+		subject, PolkitPresenceAction, details, flags, cancellationID,
+	).Store(&res)
+	return res, trace.Wrap(err)
+}
+
+func (a dbusPolkitAuthority) cancelCheckAuthorization(ctx context.Context, cancellationID string) error {
+	return trace.Wrap(a.obj.CallWithContext(ctx, polkitAuthorityIface+".CancelCheckAuthorization", 0, cancellationID).Err)
+}
+
+// describeRequester names the process behind pidfd for the dialog: its
+// executable path and pid, read from /proc and confirmed against the pidfd
+// afterwards so a recycled pid is never named. It never fails; an unknown
+// process is described as such.
+func describeRequester(pidfd int) string {
+	const unknown = "an unidentified process"
+	pid, err := pidFromPIDFD(pidfd)
+	if err != nil || pid <= 0 {
+		return unknown
+	}
+	exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+	if err != nil {
+		return unknown
+	}
+	// The pidfd still refers to a live process with this pid: the /proc read
+	// above was about the peer, not a successor.
+	if err := unix.PidfdSendSignal(pidfd, 0, nil, 0); err != nil {
+		return unknown
+	}
+	return fmt.Sprintf("%s (pid %d)", sanitizeForDialog(exe, 160), pid)
+}
+
+// pidFromPIDFD reads the pid a pidfd refers to from /proc/self/fdinfo.
+func pidFromPIDFD(pidfd int) (int, error) {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/self/fdinfo/%d", pidfd))
+	if err != nil {
+		return 0, trace.Wrap(err)
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if v, ok := strings.CutPrefix(line, "Pid:"); ok {
+			pid, err := strconv.Atoi(strings.TrimSpace(v))
+			return pid, trace.Wrap(err)
+		}
+	}
+	return 0, trace.NotFound("no Pid in fdinfo")
+}
+
+// sanitizeForDialog keeps printable ASCII and bounds the length, marking a
+// cut explicitly.
+func sanitizeForDialog(s string, max int) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= 0x20 && r < 0x7f {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('?')
+		}
+	}
+	out := b.String()
+	if len(out) > max {
+		out = out[:max] + "…"
+	}
+	return out
 }

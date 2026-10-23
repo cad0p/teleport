@@ -23,12 +23,17 @@ package touchid
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 
+	"github.com/godbus/dbus/v5"
 	"github.com/gravitational/trace"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 // fakePresence swaps the polkit and fprintd checks for fakes and records how
@@ -82,6 +87,13 @@ func TestVerifyPolkitOrFingerprint(t *testing.T) {
 			wantPolkit: 1,
 		},
 		{
+			name:       "dismissed with an error is still a cancel",
+			peer:       PresencePeer{UID: 1001, PIDFD: 7},
+			fake:       fakePresence{polkitOutcome: polkitDismissed, polkitErr: errors.New("x")},
+			wantErr:    errPresenceCancelled,
+			wantPolkit: 1,
+		},
+		{
 			name:       "dismissed is a cancel, not a fallback",
 			peer:       PresencePeer{UID: 1001, PIDFD: 7},
 			fake:       fakePresence{polkitOutcome: polkitDismissed},
@@ -91,8 +103,15 @@ func TestVerifyPolkitOrFingerprint(t *testing.T) {
 		{
 			name:       "unanswered dialog does not fall back",
 			peer:       PresencePeer{UID: 1001, PIDFD: 7},
-			fake:       fakePresence{polkitOutcome: polkitUnavailable, polkitErr: trace.Wrap(context.DeadlineExceeded)},
+			fake:       fakePresence{polkitOutcome: polkitFailed, polkitErr: trace.Wrap(context.DeadlineExceeded)},
 			wantErr:    context.DeadlineExceeded,
+			wantPolkit: 1,
+		},
+		{
+			name:       "failed attempts in the dialog do not fall back",
+			peer:       PresencePeer{UID: 1001, PIDFD: 7},
+			fake:       fakePresence{polkitOutcome: polkitFailed},
+			wantErr:    errPresenceFailed,
 			wantPolkit: 1,
 		},
 		{
@@ -146,11 +165,146 @@ func TestVerifyPolkitOrFingerprint(t *testing.T) {
 	}
 }
 
-func TestClassifyPolkitResult(t *testing.T) {
-	assert.Equal(t, polkitAuthorized, classifyPolkitResult(polkitAuthResult{IsAuthorized: true}))
-	assert.Equal(t, polkitDismissed, classifyPolkitResult(polkitAuthResult{Details: map[string]string{"polkit.dismissed": "true"}}))
-	assert.Equal(t, polkitUnavailable, classifyPolkitResult(polkitAuthResult{}))
-	assert.Equal(t, polkitUnavailable, classifyPolkitResult(polkitAuthResult{IsChallenge: true}))
+func TestClassifyInteractiveResult(t *testing.T) {
+	assert.Equal(t, polkitAuthorized, classifyInteractiveResult(polkitAuthResult{IsAuthorized: true}))
+	assert.Equal(t, polkitDismissed, classifyInteractiveResult(polkitAuthResult{Details: map[string]string{"polkit.dismissed": "true"}}))
+	// Interactive "challenge" = no authentication agent: no dialog was shown.
+	assert.Equal(t, polkitUnavailable, classifyInteractiveResult(polkitAuthResult{IsChallenge: true}))
+	// Not authorized, not dismissed, no challenge = the user failed in the dialog.
+	assert.Equal(t, polkitFailed, classifyInteractiveResult(polkitAuthResult{}))
+}
+
+// fakeAuthority records CheckAuthorization calls and answers from a script.
+type fakeAuthority struct {
+	probe       polkitAuthResult
+	probeErr    error
+	interactive polkitAuthResult
+	interErr    error
+	block       bool // the interactive call waits for ctx (an unanswered dialog)
+	calls       []fakeAuthCall
+	cancelled   []string
+}
+
+type fakeAuthCall struct {
+	subject        polkitSubject
+	details        map[string]string
+	flags          uint32
+	cancellationID string
+}
+
+func (f *fakeAuthority) checkAuthorization(ctx context.Context, subject polkitSubject, details map[string]string, flags uint32, cancellationID string) (polkitAuthResult, error) {
+	f.calls = append(f.calls, fakeAuthCall{subject, details, flags, cancellationID})
+	if flags == 0 {
+		return f.probe, f.probeErr
+	}
+	if f.block {
+		<-ctx.Done()
+		return polkitAuthResult{}, ctx.Err()
+	}
+	return f.interactive, f.interErr
+}
+
+func (f *fakeAuthority) cancelCheckAuthorization(_ context.Context, id string) error {
+	f.cancelled = append(f.cancelled, id)
+	return nil
+}
+
+func TestPolkitCheckWith(t *testing.T) {
+	peer := PresencePeer{UID: 1001, PIDFD: 9}
+	challenge := polkitAuthResult{IsChallenge: true}
+
+	t.Run("probe then interactive call with the peer as subject", func(t *testing.T) {
+		f := &fakeAuthority{probe: challenge, interactive: polkitAuthResult{IsAuthorized: true}}
+		out, err := polkitCheckWith(context.Background(), f, peer, "/usr/bin/tsh (pid 42)")
+		require.NoError(t, err)
+		assert.Equal(t, polkitAuthorized, out)
+		require.Len(t, f.calls, 2)
+		assert.Equal(t, uint32(0), f.calls[0].flags, "probe must not interact")
+		assert.Equal(t, polkitCheckAllowUserInteraction, f.calls[1].flags, "second call must allow interaction")
+		assert.NotEmpty(t, f.calls[1].cancellationID)
+		for _, c := range f.calls {
+			assert.Equal(t, "unix-process", c.subject.Kind)
+			assert.Equal(t, dbus.UnixFD(9), c.subject.Details["pidfd"].Value())
+			assert.Equal(t, int32(1001), c.subject.Details["uid"].Value())
+		}
+		assert.Contains(t, f.calls[1].details["polkit.message"], "/usr/bin/tsh (pid 42)")
+	})
+
+	t.Run("auto-granted action is refused without a dialog", func(t *testing.T) {
+		f := &fakeAuthority{probe: polkitAuthResult{IsAuthorized: true}, interactive: polkitAuthResult{IsAuthorized: true}}
+		out, err := polkitCheckWith(context.Background(), f, peer, "x")
+		require.True(t, trace.IsAccessDenied(err), "err = %v", err)
+		assert.Equal(t, polkitUnavailable, out)
+		assert.Len(t, f.calls, 1)
+	})
+
+	t.Run("inactive session: no challenge, no dialog", func(t *testing.T) {
+		f := &fakeAuthority{probe: polkitAuthResult{}}
+		out, err := polkitCheckWith(context.Background(), f, peer, "x")
+		require.True(t, trace.IsNotFound(err), "err = %v", err)
+		assert.Equal(t, polkitUnavailable, out)
+		assert.Len(t, f.calls, 1)
+	})
+
+	t.Run("probe error: no dialog", func(t *testing.T) {
+		f := &fakeAuthority{probeErr: errors.New("bus down")}
+		out, err := polkitCheckWith(context.Background(), f, peer, "x")
+		require.Error(t, err)
+		assert.Equal(t, polkitUnavailable, out)
+		assert.Len(t, f.calls, 1)
+	})
+
+	t.Run("no agent: interactive challenge", func(t *testing.T) {
+		f := &fakeAuthority{probe: challenge, interactive: challenge}
+		out, err := polkitCheckWith(context.Background(), f, peer, "x")
+		require.NoError(t, err)
+		assert.Equal(t, polkitUnavailable, out)
+	})
+
+	t.Run("failed attempts", func(t *testing.T) {
+		f := &fakeAuthority{probe: challenge, interactive: polkitAuthResult{}}
+		out, err := polkitCheckWith(context.Background(), f, peer, "x")
+		require.NoError(t, err)
+		assert.Equal(t, polkitFailed, out)
+	})
+
+	t.Run("interactive call error fails closed", func(t *testing.T) {
+		f := &fakeAuthority{probe: challenge, interErr: errors.New("disconnected")}
+		out, err := polkitCheckWith(context.Background(), f, peer, "x")
+		require.Error(t, err)
+		assert.Equal(t, polkitFailed, out)
+	})
+
+	t.Run("unanswered dialog is cancelled and fails", func(t *testing.T) {
+		f := &fakeAuthority{probe: challenge, block: true}
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		out, err := polkitCheckWith(ctx, f, peer, "x")
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		assert.Equal(t, polkitFailed, out)
+		require.Len(t, f.cancelled, 1)
+		assert.Equal(t, f.calls[1].cancellationID, f.cancelled[0], "the shown dialog must be cancelled")
+	})
+}
+
+func TestSanitizeForDialog(t *testing.T) {
+	assert.Equal(t, "/usr/bin/tsh", sanitizeForDialog("/usr/bin/tsh", 160))
+	assert.Equal(t, "a?b", sanitizeForDialog("a\nb", 160))
+	assert.Equal(t, "abc…", sanitizeForDialog("abcdef", 3))
+}
+
+func TestDescribeRequesterSelf(t *testing.T) {
+	fd, err := unix.PidfdOpen(os.Getpid(), 0)
+	if err != nil {
+		t.Skipf("pidfd_open unavailable: %v", err)
+	}
+	defer unix.Close(fd)
+	exe, err := os.Executable()
+	require.NoError(t, err)
+	got := describeRequester(fd)
+	assert.Contains(t, got, "(pid "+strconv.Itoa(os.Getpid())+")")
+	assert.Contains(t, got, filepath.Base(exe))
+	assert.Equal(t, "an unidentified process", describeRequester(-1))
 }
 
 func TestPresenceFailureIsNotCached(t *testing.T) {
@@ -190,6 +344,9 @@ func TestAuthContextBoundToCreatorUID(t *testing.T) {
 	_, err = srv.dispatch(mallory, &helperRequest{Method: helperMethodAuthenticate, Params: []byte(`{"context_id":` + itoa(ctxID) + `,"credential_id":"x","digest":""}`)})
 	require.True(t, trace.IsAccessDenied(err), "authenticate from another uid: %v", err)
 	assert.Equal(t, 0, f.polkitCalls, "a refused context must not prompt")
+
+	_, err = srv.dispatch(mallory, &helperRequest{Method: helperMethodAuthContextClose, Params: params})
+	require.True(t, trace.IsAccessDenied(err), "close from another uid: %v", err)
 
 	_, err = srv.dispatch(alice, &helperRequest{Method: helperMethodAuthContextGuard, Params: params})
 	require.NoError(t, err)

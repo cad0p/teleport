@@ -234,6 +234,9 @@ func (s *HelperServer) dispatch(peer PresencePeer, req *helperRequest) (any, err
 		if err := json.Unmarshal(req.Params, &params); err != nil {
 			return nil, trace.Wrap(err, "invalid AuthContextClose params")
 		}
+		if err := s.checkContextOwner(params.ContextID, uid); err != nil {
+			return nil, trace.Wrap(err)
+		}
 		s.svc.closeAuthContext(params.ContextID)
 		return nil, nil
 

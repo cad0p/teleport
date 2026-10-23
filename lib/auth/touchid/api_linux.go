@@ -32,13 +32,15 @@ package touchid
 //   - a software P-256 key, sealed at rest with the SEP-backed "trusted" key
 //     source as a root-only blob under /var/lib/tsh-touchid (0600) and unsealed
 //     into the daemon's memory at start-up (see sealed_store_linux.go); and
-//   - user presence via an fprintd fingerprint verification, requested over
-//     D-Bus (net.reactivated.Fprint).
+//   - user presence via the desktop's polkit authentication dialog (fingerprint
+//     or password, see polkit_linux.go), with an fprintd fingerprint
+//     verification over D-Bus (net.reactivated.Fprint) as the fallback when no
+//     dialog can be shown.
 //
-// Note that, unlike macOS, the fingerprint check is still not a key-access
+// Note that, unlike macOS, the presence check is still not a key-access
 // control: once the daemon has unsealed a key it lives in the daemon's memory,
-// and /dev/trusted_unseal is a root-only bearer oracle (S3), so the fprintd
-// prompt remains a presence check, not a cryptographic boundary. What I1b adds
+// and /dev/trusted_unseal is a root-only bearer oracle (S3), so the prompt
+// remains a presence check, not a cryptographic boundary. What I1b adds
 // is that the plaintext is never stored in a user-readable file, the unseal
 // happens only inside the root daemon, and the key never reaches the tsh
 // process: tsh only sends a digest and receives a signature.
