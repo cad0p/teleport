@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  User-presence check for the Linux tsh Touch ID helper (tsh-touchid-helper).
+  Install to /usr/share/polkit-1/actions/. The helper asks polkit for this
+  action on behalf of the connecting tsh process, so the desktop's polkit agent
+  shows a dialog (fingerprint or password, per /etc/pam.d/polkit-1).
+
+  auth_self, never *_keep: every check needs a fresh authentication (the helper
+  keeps its own 10 s reuse window). Inactive and remote sessions get "no", which
+  makes the helper fall back to the plain fprintd check.
+-->
+<policyconfig>
+  <vendor>cad0p/teleport (tsh Linux Touch ID helper)</vendor>
+  <vendor_url>https://github.com/cad0p/teleport</vendor_url>
+  <action id="com.github.cad0p.tsh-touchid.presence">
+    <description>Use a Teleport Touch ID credential</description>
+    <message>Teleport (tsh) wants to use your Touch ID credential. Confirm with your fingerprint or password.</message>
+    <icon_name>dialog-password</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+  </action>
+</policyconfig>

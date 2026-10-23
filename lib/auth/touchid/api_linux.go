@@ -598,24 +598,25 @@ func newSignService() *signService {
 	}
 }
 
-// verifyPresence is the user-presence check used by signService. It is a
-// package variable so tests can substitute a fake fingerprint check.
-var verifyPresence = verifyFingerprint
+// verifyPresence is the user-presence check used by signService: the polkit
+// dialog, with the fprintd check as the fallback (see polkit_linux.go). It is
+// a package variable so tests can substitute a fake presence check.
+var verifyPresence = verifyPolkitOrFingerprint
 
-// ensureVerified asks for a fingerprint unless a verification for uid happened
-// within the reuse window. It fails closed.
-func (s *signService) ensureVerified(uid uint32) error {
+// ensureVerified asks for user presence unless a verification for the peer's
+// uid happened within the reuse window. It fails closed.
+func (s *signService) ensureVerified(peer PresencePeer) error {
 	s.verifyMu.Lock()
 	defer s.verifyMu.Unlock()
 
-	if t, ok := s.verifiedAt[uid]; ok && time.Since(t) < fingerprintReuseWindow {
-		logger.DebugContext(context.Background(), "Reusing fingerprint verification", "uid", uid)
+	if t, ok := s.verifiedAt[peer.UID]; ok && time.Since(t) < fingerprintReuseWindow {
+		logger.DebugContext(context.Background(), "Reusing presence verification", "uid", peer.UID)
 		return nil
 	}
-	if err := verifyPresence(context.Background(), uid); err != nil {
+	if err := verifyPresence(context.Background(), peer); err != nil {
 		return trace.Wrap(err)
 	}
-	s.verifiedAt[uid] = time.Now()
+	s.verifiedAt[peer.UID] = time.Now()
 	return nil
 }
 
@@ -643,25 +644,25 @@ func (s *signService) authContextUID(contextID int) (uint32, bool) {
 	return uid, ok
 }
 
-func (s *signService) authenticate(uid uint32, credentialID string, digest []byte) ([]byte, error) {
-	if err := s.ensureVerified(uid); err != nil {
+func (s *signService) authenticate(peer PresencePeer, credentialID string, digest []byte) ([]byte, error) {
+	if err := s.ensureVerified(peer); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return loadAndSign(credentialID, digest)
 }
 
-func (s *signService) listCredentials(uid uint32) ([]CredentialInfo, error) {
-	// Match macOS semantics: listing requires user interaction (the fprintd
+func (s *signService) listCredentials(peer PresencePeer) ([]CredentialInfo, error) {
+	// Match macOS semantics: listing requires user interaction (the presence
 	// prompt), even though the metadata itself is a regular user-owned file.
-	if err := s.ensureVerified(uid); err != nil {
+	if err := s.ensureVerified(peer); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return listCredentialInfos()
 }
 
-func (s *signService) deleteCredential(uid uint32, credentialID string) error {
+func (s *signService) deleteCredential(peer PresencePeer, credentialID string) error {
 	// Match macOS semantics: deletion requires user interaction.
-	if err := s.ensureVerified(uid); err != nil {
+	if err := s.ensureVerified(peer); err != nil {
 		return trace.Wrap(err)
 	}
 	return deleteCredentialNonInteractive(credentialID)

@@ -65,7 +65,7 @@ func startTestHelper(t *testing.T) (*helperNative, *int32) {
 
 	var calls int32
 	prev := verifyPresence
-	verifyPresence = func(context.Context, uint32) error {
+	verifyPresence = func(context.Context, PresencePeer) error {
 		atomic.AddInt32(&calls, 1)
 		return nil
 	}

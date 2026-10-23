@@ -89,8 +89,16 @@ func NewHelperServer() *HelperServer {
 
 // ServeConn handles a single client connection. It returns when the client
 // disconnects. uid is the SO_PEERCRED uid of the connection, already validated
-// by the caller.
+// by the caller. Without a peer pidfd, presence checks use fprintd only; the
+// daemon uses ServePeer.
 func (s *HelperServer) ServeConn(conn net.Conn, uid uint32) error {
+	return s.ServePeer(conn, PresencePeer{UID: uid, PIDFD: -1})
+}
+
+// ServePeer handles a single client connection whose peer has been identified
+// by the caller (SO_PEERCRED uid, already validated, plus an optional pidfd
+// that stays owned by the caller). It returns when the client disconnects.
+func (s *HelperServer) ServePeer(conn net.Conn, peer PresencePeer) error {
 	defer conn.Close()
 
 	scanner := bufio.NewScanner(conn)
@@ -109,7 +117,7 @@ func (s *HelperServer) ServeConn(conn net.Conn, uid uint32) error {
 			continue
 		}
 
-		result, err := s.dispatch(uid, &req)
+		result, err := s.dispatch(peer, &req)
 		resp := helperResponse{ID: req.ID}
 		switch {
 		case err != nil:
@@ -136,7 +144,8 @@ func (s *HelperServer) ServeConn(conn net.Conn, uid uint32) error {
 
 // dispatch runs a single request and returns the result to marshal (nil for
 // methods with an empty result).
-func (s *HelperServer) dispatch(uid uint32, req *helperRequest) (any, error) {
+func (s *HelperServer) dispatch(peer PresencePeer, req *helperRequest) (any, error) {
+	uid := peer.UID
 	switch req.Method {
 	case helperMethodDiag:
 		res, err := diag(uid)
@@ -164,15 +173,12 @@ func (s *HelperServer) dispatch(uid uint32, req *helperRequest) (any, error) {
 		if err := json.Unmarshal(req.Params, &params); err != nil {
 			return nil, trace.Wrap(err, "invalid Authenticate params")
 		}
-		contextUID := uid
 		if params.ContextID != 0 {
-			cu, ok := s.svc.authContextUID(params.ContextID)
-			if !ok {
-				return nil, trace.Errorf("auth context %d not found", params.ContextID)
+			if err := s.checkContextOwner(params.ContextID, uid); err != nil {
+				return nil, trace.Wrap(err)
 			}
-			contextUID = cu
 		}
-		sig, err := s.svc.authenticate(contextUID, params.CredentialID, params.Digest)
+		sig, err := s.svc.authenticate(peer, params.CredentialID, params.Digest)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -190,7 +196,7 @@ func (s *HelperServer) dispatch(uid uint32, req *helperRequest) (any, error) {
 		return findCredentialsResult{Credentials: credentialInfosToProtocol(infos)}, nil
 
 	case helperMethodListCredentials:
-		infos, err := s.svc.listCredentials(uid)
+		infos, err := s.svc.listCredentials(peer)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -201,7 +207,7 @@ func (s *HelperServer) dispatch(uid uint32, req *helperRequest) (any, error) {
 		if err := json.Unmarshal(req.Params, &params); err != nil {
 			return nil, trace.Wrap(err, "invalid DeleteCredential params")
 		}
-		return nil, trace.Wrap(s.svc.deleteCredential(uid, params.CredentialID))
+		return nil, trace.Wrap(s.svc.deleteCredential(peer, params.CredentialID))
 
 	case helperMethodDeleteNonInteractive:
 		var params deleteNonInteractiveParams
@@ -218,11 +224,10 @@ func (s *HelperServer) dispatch(uid uint32, req *helperRequest) (any, error) {
 		if err := json.Unmarshal(req.Params, &params); err != nil {
 			return nil, trace.Wrap(err, "invalid AuthContextGuard params")
 		}
-		contextUID, ok := s.svc.authContextUID(params.ContextID)
-		if !ok {
-			return nil, trace.Errorf("auth context %d not found", params.ContextID)
+		if err := s.checkContextOwner(params.ContextID, uid); err != nil {
+			return nil, trace.Wrap(err)
 		}
-		return nil, trace.Wrap(s.svc.ensureVerified(contextUID))
+		return nil, trace.Wrap(s.svc.ensureVerified(peer))
 
 	case helperMethodAuthContextClose:
 		var params authContextCloseParams
@@ -235,6 +240,20 @@ func (s *HelperServer) dispatch(uid uint32, req *helperRequest) (any, error) {
 	default:
 		return nil, trace.Errorf("unknown method: %q", req.Method)
 	}
+}
+
+// checkContextOwner refuses an auth context that does not exist or that was
+// created by another uid: presence is checked for, and recorded against, the
+// connection's own peer, so a context must not carry another user's identity.
+func (s *HelperServer) checkContextOwner(contextID int, uid uint32) error {
+	owner, ok := s.svc.authContextUID(contextID)
+	if !ok {
+		return trace.Errorf("auth context %d not found", contextID)
+	}
+	if owner != uid {
+		return trace.AccessDenied("auth context %d belongs to another user", contextID)
+	}
+	return nil
 }
 
 func diagResultFromCore(d *DiagResult) diagResult {

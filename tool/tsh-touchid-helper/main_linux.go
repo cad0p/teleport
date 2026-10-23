@@ -198,11 +198,25 @@ func runDaemon(args []string) {
 			continue
 		}
 
-		go func(c *net.UnixConn, u uint32) {
-			if err := srv.ServeConn(c, u); err != nil {
+		// The pidfd pins the peer process for the polkit presence check; it
+		// stays open for the life of the connection. Without one, presence
+		// falls back to fprintd only.
+		pidfd, err := peerPIDFD(conn)
+		if err != nil {
+			log.Printf("peer pidfd unavailable (presence falls back to fprintd): %v", err)
+			pidfd = -1
+		}
+
+		go func(c *net.UnixConn, peer touchid.PresencePeer) {
+			defer func() {
+				if peer.PIDFD >= 0 {
+					_ = unix.Close(peer.PIDFD)
+				}
+			}()
+			if err := srv.ServePeer(c, peer); err != nil {
 				log.Printf("connection closed: %v", err)
 			}
-		}(conn, uid)
+		}(conn, touchid.PresencePeer{UID: uid, PIDFD: pidfd})
 	}
 }
 
@@ -250,6 +264,29 @@ func peerUID(conn *net.UnixConn) (uint32, error) {
 		return 0, sockErr
 	}
 	return ucred.Uid, nil
+}
+
+// peerPIDFD returns a pidfd for the process on the other end of an AF_UNIX
+// connection, via SO_PEERPIDFD (Linux 6.5+). The caller owns the fd.
+func peerPIDFD(conn *net.UnixConn) (int, error) {
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		return -1, err
+	}
+	var (
+		pidfd   = -1
+		sockErr error
+	)
+	if err := raw.Control(func(fd uintptr) {
+		pidfd, sockErr = unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_PEERPIDFD)
+	}); err != nil {
+		return -1, err
+	}
+	if sockErr != nil {
+		return -1, sockErr
+	}
+	unix.CloseOnExec(pidfd)
+	return pidfd, nil
 }
 
 func fatal(err error) {
