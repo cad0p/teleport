@@ -30,6 +30,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gravitational/trace"
 	"github.com/stretchr/testify/assert"
@@ -165,22 +166,23 @@ func TestHelperAuthenticateSignsAndReusesPresence(t *testing.T) {
 	pub := &ecdsa.PublicKey{Curve: elliptic.P256(), X: x, Y: y}
 	assert.True(t, ecdsa.VerifyASN1(pub, digest[:], sig), "signature must verify")
 
-	// One prompt for the registration, one for the first signature with the
-	// credential...
-	require.Equal(t, int32(2), atomic.LoadInt32(calls))
-	// ...and the 10s reuse window suppresses the second prompt for the same
-	// credential.
+	// One dialog in all: the registration approval covers the new
+	// credential's first signature (the attestation tsh signs next)...
+	require.Equal(t, int32(1), atomic.LoadInt32(calls))
+	// ...and the 10s reuse window covers further signatures with it.
 	_, err = h.Authenticate(nil, info.CredentialID, digest[:])
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), atomic.LoadInt32(calls))
+
+	// An approval for one credential never covers another (round-4 red-team F2).
+	// The registration of bob opens a window for bob's credential only.
+	other, err := h.Register("example.com", "bob", []byte("bob"))
+	require.NoError(t, err)
+	require.Equal(t, int32(2), atomic.LoadInt32(calls))
+	_, err = h.Authenticate(nil, other.CredentialID, digest[:])
 	require.NoError(t, err)
 	assert.Equal(t, int32(2), atomic.LoadInt32(calls))
 
-	// An approval for one credential never covers another (round-4 red-team F2).
-	other, err := h.Register("example.com", "bob", []byte("bob"))
-	require.NoError(t, err)
-	before := atomic.LoadInt32(calls)
-	_, err = h.Authenticate(nil, other.CredentialID, digest[:])
-	require.NoError(t, err)
-	assert.Equal(t, before+1, atomic.LoadInt32(calls), "a different credential must prompt again")
 }
 
 // TestPresenceReasonFromStore pins that the dialog's "for <user>@<rp id>" comes
@@ -228,10 +230,66 @@ func TestPresenceReasonFromStore(t *testing.T) {
 	assert.Equal(t, []string{"registering pier@teleport.pcad.it"}, reasons)
 }
 
+// TestReuseScopedPerCredential pins that an approval covers only the
+// credential it named: signing with A does not open a window for B
+// (round-4 red-team F2), and a registration opens one only for the new
+// credential.
+func TestReuseScopedPerCredential(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	prevSeal, prevUnseal := sealKeyMaterial, unsealKeyMaterial
+	sealKeyMaterial = func(scalar []byte) ([]byte, error) { return append([]byte(nil), scalar...), nil }
+	unsealKeyMaterial = func(blob []byte) ([]byte, error) { return append([]byte(nil), blob...), nil }
+	t.Cleanup(func() { sealKeyMaterial, unsealKeyMaterial = prevSeal, prevUnseal })
+
+	var reasons []string
+	prev := verifyPresence
+	verifyPresence = func(_ context.Context, p PresencePeer) error {
+		reasons = append(reasons, p.Reason)
+		return nil
+	}
+	t.Cleanup(func() { verifyPresence = prev })
+
+	// Registered outside the service, so no window exists for either.
+	a, err := registerCredential("teleport.pcad.it", "teleport-admin", []byte("a"))
+	require.NoError(t, err)
+	b, err := registerCredential("teleport-admin.piercloud.net", "pier", []byte("b"))
+	require.NoError(t, err)
+
+	svc := newSignService()
+	peer := PresencePeer{UID: 1001, PIDFD: -1}
+	digest := sha256.Sum256([]byte("x"))
+	_, err = svc.authenticate(peer, a.CredentialID, digest[:])
+	require.NoError(t, err)
+	_, err = svc.authenticate(peer, a.CredentialID, digest[:])
+	require.NoError(t, err)
+	_, err = svc.authenticate(peer, b.CredentialID, digest[:])
+	require.NoError(t, err)
+	assert.Equal(t, []string{"teleport-admin@teleport.pcad.it", "pier@teleport-admin.piercloud.net"}, reasons,
+		"A is reused within its window; B asks again, naming B")
+
+	// A registration opens a window for its new credential only.
+	reasons = nil
+	c, err := svc.register(peer, "teleport.pcad.it", "pier", []byte("c"))
+	require.NoError(t, err)
+	_, err = svc.authenticate(peer, c.CredentialID, digest[:])
+	require.NoError(t, err)
+	assert.Equal(t, []string{"registering pier@teleport.pcad.it"}, reasons, "one dialog for register + attestation")
+
+	// The window expires.
+	svc.verifyMu.Lock()
+	for k := range svc.verifiedAt {
+		svc.verifiedAt[k] = time.Now().Add(-fingerprintReuseWindow)
+	}
+	svc.verifyMu.Unlock()
+	_, err = svc.authenticate(peer, c.CredentialID, digest[:])
+	require.NoError(t, err)
+	assert.Equal(t, []string{"registering pier@teleport.pcad.it", "pier@teleport.pcad.it"}, reasons)
+}
+
 func TestHelperAuthContext(t *testing.T) {
 	h, calls := startTestHelper(t)
 
-	info, err := h.Register("example.com", "alice", []byte("handle"))
+	_, err := h.Register("example.com", "alice", []byte("handle"))
 	require.NoError(t, err)
 
 	actx := h.NewAuthContext()
@@ -240,14 +298,7 @@ func TestHelperAuthContext(t *testing.T) {
 	var ran bool
 	require.NoError(t, actx.Guard(func() { ran = true }))
 	assert.True(t, ran)
-	require.Equal(t, int32(2), atomic.LoadInt32(calls)) // register + guard
-
-	// A Guard approval ("choosing a Teleport user") does not cover signing
-	// with a specific credential: that dialog names the credential.
-	digest := sha256.Sum256([]byte("hello"))
-	_, err = h.Authenticate(actx, info.CredentialID, digest[:])
-	require.NoError(t, err)
-	assert.Equal(t, int32(3), atomic.LoadInt32(calls))
+	require.Equal(t, int32(1), atomic.LoadInt32(calls), "Guard shows no dialog; only the registration did")
 	actx.Close()
 }
 

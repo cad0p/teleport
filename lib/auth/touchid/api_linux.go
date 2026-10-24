@@ -634,8 +634,10 @@ func (s *signService) ensureVerified(peer PresencePeer) error {
 
 // register creates a credential after a presence check, so a label can only
 // appear in a later dialog after the user approved its registration. The
-// scope is per registration request, so it never reuses (or opens) a window
-// for an existing credential.
+// approval ("registering <user>@<rp id>") also covers the new credential's
+// first signature within the reuse window — tsh signs the attestation right
+// after registering — so registration is one dialog. It opens no window for
+// any existing credential.
 func (s *signService) register(peer PresencePeer, rpID, user string, userHandle []byte) (*CredentialInfo, error) {
 	peer.Reason = "registering " + user + "@" + rpID
 	peer.Scope = "register:" + user + "@" + rpID
@@ -643,7 +645,13 @@ func (s *signService) register(peer PresencePeer, rpID, user string, userHandle 
 		return nil, trace.Wrap(err)
 	}
 	info, err := registerCredential(rpID, user, userHandle)
-	return info, trace.Wrap(err)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	s.verifyMu.Lock()
+	s.verifiedAt[presenceKey{uid: peer.UID, scope: "credential:" + info.CredentialID}] = time.Now()
+	s.verifyMu.Unlock()
+	return info, nil
 }
 
 // newAuthContext allocates a context for uid and returns its ID.

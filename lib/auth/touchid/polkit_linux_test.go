@@ -382,13 +382,11 @@ func TestAuthContextBoundToCreatorUID(t *testing.T) {
 	_, err = srv.dispatch(mallory, &helperRequest{Method: helperMethodAuthContextClose, Params: params})
 	require.True(t, trace.IsAccessDenied(err), "close from another uid: %v", err)
 
+	// The owner's Guard succeeds without a dialog: the signature that follows
+	// asks, naming the picked credential.
 	_, err = srv.dispatch(alice, &helperRequest{Method: helperMethodAuthContextGuard, Params: params})
 	require.NoError(t, err)
-	assert.Equal(t, 1, f.polkitCalls)
-	want := alice
-	want.Reason = "choosing a Teleport user"
-	want.Scope = "guard"
-	assert.Equal(t, want, f.lastPeer)
+	assert.Equal(t, 0, f.polkitCalls)
 }
 
 func itoa(i int) string { return strconv.Itoa(i) }

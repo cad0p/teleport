@@ -227,9 +227,11 @@ func (s *HelperServer) dispatch(peer PresencePeer, req *helperRequest) (any, err
 		if err := s.checkContextOwner(params.ContextID, uid); err != nil {
 			return nil, trace.Wrap(err)
 		}
-		peer.Reason = "choosing a Teleport user"
-		peer.Scope = "guard"
-		return nil, trace.Wrap(s.svc.ensureVerified(peer))
+		// No dialog here. tsh guards only its user picker, which shows names
+		// FindCredentials already returns without presence; asking now could
+		// not name the credential. The signature that follows asks, naming the
+		// picked "<user>@<rp id>", so a login is one dialog with the right text.
+		return nil, nil
 
 	case helperMethodAuthContextClose:
 		var params authContextCloseParams
