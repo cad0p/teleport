@@ -310,6 +310,12 @@ func TestDescribeRequesterSelf(t *testing.T) {
 	assert.Equal(t, "an unidentified process", describeRequester(-1))
 }
 
+func TestSplitCmdline(t *testing.T) {
+	assert.Equal(t, []string{"tsh", "ssh", ""}, splitCmdline([]byte("tsh\x00ssh\x00\x00")))
+	assert.Equal(t, []string{"tsh", "ssh"}, splitCmdline([]byte("tsh\x00ssh\x00")))
+	assert.Equal(t, []string{""}, splitCmdline(nil))
+}
+
 func TestCommandForDialog(t *testing.T) {
 	assert.Equal(t, "tsh ssh admin@pcad-it", commandForDialog("tsh ssh admin@pcad-it", 60))
 	assert.Equal(t, "tsh ssh a?b", commandForDialog("tsh ssh a\nb", 60))
@@ -321,6 +327,8 @@ func TestPresenceMessage(t *testing.T) {
 		presenceMessage("teleport-admin@teleport.pcad.it", "tsh ssh admin@pcad-it"))
 	assert.Equal(t, "Teleport Touch ID · tsh touchid ls", presenceMessage("", "tsh touchid ls"))
 	assert.Equal(t, "Teleport Touch ID for a?b · x", presenceMessage("a\nb", "x"))
+	long := strings.Repeat("x", 90) + "@evil.example"
+	assert.Equal(t, "Teleport Touch ID for "+strings.Repeat("x", 80)+"… (+23 chars) · y", presenceMessage(long, "y"), "a cut reason must say how much is hidden")
 }
 
 func TestPolkitMessageCarriesReason(t *testing.T) {
@@ -379,6 +387,7 @@ func TestAuthContextBoundToCreatorUID(t *testing.T) {
 	assert.Equal(t, 1, f.polkitCalls)
 	want := alice
 	want.Reason = "choosing a Teleport user"
+	want.Scope = "guard"
 	assert.Equal(t, want, f.lastPeer)
 }
 

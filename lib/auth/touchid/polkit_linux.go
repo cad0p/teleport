@@ -35,8 +35,11 @@ package touchid
 // is a failure, not a fallback.
 //
 // The dialog says "Teleport Touch ID for <user>@<cluster> · <command>". The
-// "<user>@<cluster>" part comes from the root-owned credential store entry the
-// request would sign with, so the client cannot change it. The command is the
+// "<user>@<cluster>" part is the label stored (root-only store) with the
+// credential the request would sign with. A request cannot relabel an
+// existing credential, and registering one needs an approved "registering
+// <label>" dialog, but the label text is whatever the registering process
+// chose: it names the credential, it does not prove the cluster. The command is the
 // requester's argv with argv[0] replaced by its real executable's basename: any
 // process of an allowed uid can connect, and it controls its own argv, so the
 // command says what the requester claims to be doing, not proof that it is
@@ -83,13 +86,17 @@ const (
 // (SO_PEERPIDFD), or -1 when none is available; without a pidfd the polkit
 // path is skipped, because a bare pid can be recycled before polkit reads it.
 //
-// Reason says what the presence is for, for the dialog text. signService sets
-// it from the root-owned credential store (e.g. "teleport-admin@teleport.pcad.it"),
-// never from the client's request, so it is the trustworthy part of the text.
+// Reason says what the presence is for, for the dialog text: for a signature,
+// the "<user>@<rp id>" label stored with the credential when it was
+// registered (registration itself needs an approved dialog naming that label),
+// so a request cannot relabel an existing credential; the label text was
+// still chosen by whoever registered it. Scope keys the reuse window (see
+// signService.ensureVerified).
 type PresencePeer struct {
 	UID    uint32
 	PIDFD  int
 	Reason string
+	Scope  string
 }
 
 // polkitOutcome is the result of an interactive polkit check.
@@ -217,7 +224,7 @@ func presenceMessage(reason, requester string) string {
 	if reason == "" {
 		return "Teleport Touch ID · " + requester
 	}
-	return "Teleport Touch ID for " + sanitizeForDialog(reason, 80) + " · " + requester
+	return "Teleport Touch ID for " + commandForDialog(reason, 80) + " · " + requester
 }
 
 // polkitCheckWith runs the probe and the interactive check against authority.
@@ -325,11 +332,17 @@ func describeRequester(pidfd int) string {
 	if err := unix.PidfdSendSignal(pidfd, 0, nil, 0); err != nil {
 		return unknown
 	}
-	args := strings.Split(strings.TrimRight(string(rawArgs), "\x00"), "\x00")
+	args := splitCmdline(rawArgs)
 	words := append([]string{filepath.Base(exe)}, args[1:]...)
 	cmd := strings.Join(words, " ")
 	logger.InfoContext(context.Background(), "Presence requested", "pid", pid, "exe", exe, "cmdline", strings.Join(args, " "))
 	return commandForDialog(cmd, requesterCommandMax)
+}
+
+// splitCmdline splits /proc/<pid>/cmdline (NUL-terminated argv). Only the
+// final terminator is dropped, so an empty last argument is kept.
+func splitCmdline(raw []byte) []string {
+	return strings.Split(strings.TrimSuffix(string(raw), "\x00"), "\x00")
 }
 
 // commandForDialog sanitizes cmd and, when it is longer than max, cuts it with

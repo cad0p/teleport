@@ -159,7 +159,7 @@ func (s *HelperServer) dispatch(peer PresencePeer, req *helperRequest) (any, err
 		if err := json.Unmarshal(req.Params, &params); err != nil {
 			return nil, trace.Wrap(err, "invalid Register params")
 		}
-		info, err := registerCredential(params.RPID, params.User, params.UserHandle)
+		info, err := s.svc.register(peer, params.RPID, params.User, params.UserHandle)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -228,6 +228,7 @@ func (s *HelperServer) dispatch(peer PresencePeer, req *helperRequest) (any, err
 			return nil, trace.Wrap(err)
 		}
 		peer.Reason = "choosing a Teleport user"
+		peer.Scope = "guard"
 		return nil, trace.Wrap(s.svc.ensureVerified(peer))
 
 	case helperMethodAuthContextClose:

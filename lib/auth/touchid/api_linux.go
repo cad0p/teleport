@@ -585,8 +585,10 @@ type signService struct {
 	// verifyMu serializes presence checks, so concurrent connections don't
 	// stack up fprintd prompts.
 	verifyMu sync.Mutex
-	// verifiedAt records, per uid, when presence was last confirmed.
-	verifiedAt map[uint32]time.Time
+	// verifiedAt records when presence was last confirmed, per uid and scope:
+	// an approval covers only the operation it was shown for (one credential,
+	// listing, ...), so a dialog for credential A never silently authorizes B.
+	verifiedAt map[presenceKey]time.Time
 
 	mu            sync.Mutex
 	nextContextID int
@@ -595,7 +597,7 @@ type signService struct {
 
 func newSignService() *signService {
 	return &signService{
-		verifiedAt: make(map[uint32]time.Time),
+		verifiedAt: make(map[presenceKey]time.Time),
 		contexts:   make(map[int]uint32),
 	}
 }
@@ -605,21 +607,43 @@ func newSignService() *signService {
 // a package variable so tests can substitute a fake presence check.
 var verifyPresence = verifyPolkitOrFingerprint
 
-// ensureVerified asks for user presence unless a verification for the peer's
-// uid happened within the reuse window. It fails closed.
+// presenceKey scopes the reuse window.
+type presenceKey struct {
+	uid   uint32
+	scope string
+}
+
+// ensureVerified asks for user presence unless a verification for the same
+// uid and scope (peer.Scope) happened within the reuse window. It fails
+// closed.
 func (s *signService) ensureVerified(peer PresencePeer) error {
 	s.verifyMu.Lock()
 	defer s.verifyMu.Unlock()
 
-	if t, ok := s.verifiedAt[peer.UID]; ok && time.Since(t) < fingerprintReuseWindow {
-		logger.DebugContext(context.Background(), "Reusing presence verification", "uid", peer.UID)
+	key := presenceKey{uid: peer.UID, scope: peer.Scope}
+	if t, ok := s.verifiedAt[key]; ok && time.Since(t) < fingerprintReuseWindow {
+		logger.DebugContext(context.Background(), "Reusing presence verification", "uid", peer.UID, "scope", peer.Scope)
 		return nil
 	}
 	if err := verifyPresence(context.Background(), peer); err != nil {
 		return trace.Wrap(err)
 	}
-	s.verifiedAt[peer.UID] = time.Now()
+	s.verifiedAt[key] = time.Now()
 	return nil
+}
+
+// register creates a credential after a presence check, so a label can only
+// appear in a later dialog after the user approved its registration. The
+// scope is per registration request, so it never reuses (or opens) a window
+// for an existing credential.
+func (s *signService) register(peer PresencePeer, rpID, user string, userHandle []byte) (*CredentialInfo, error) {
+	peer.Reason = "registering " + user + "@" + rpID
+	peer.Scope = "register:" + user + "@" + rpID
+	if err := s.ensureVerified(peer); err != nil {
+		return nil, trace.Wrap(err)
+	}
+	info, err := registerCredential(rpID, user, userHandle)
+	return info, trace.Wrap(err)
 }
 
 // newAuthContext allocates a context for uid and returns its ID.
@@ -669,6 +693,7 @@ func (s *signService) authenticate(peer PresencePeer, credentialID string, diges
 		return nil, trace.Wrap(err)
 	}
 	peer.Reason = label
+	peer.Scope = "credential:" + credentialID
 	if err := s.ensureVerified(peer); err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -679,6 +704,7 @@ func (s *signService) listCredentials(peer PresencePeer) ([]CredentialInfo, erro
 	// Match macOS semantics: listing requires user interaction (the presence
 	// prompt), even though the metadata itself is a regular user-owned file.
 	peer.Reason = "listing Touch ID credentials"
+	peer.Scope = "list"
 	if err := s.ensureVerified(peer); err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -692,6 +718,7 @@ func (s *signService) deleteCredential(peer PresencePeer, credentialID string) e
 		return trace.Wrap(err)
 	}
 	peer.Reason = "deleting " + label
+	peer.Scope = "delete:" + credentialID
 	if err := s.ensureVerified(peer); err != nil {
 		return trace.Wrap(err)
 	}

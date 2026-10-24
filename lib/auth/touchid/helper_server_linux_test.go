@@ -89,6 +89,8 @@ func TestHelperRegisterFindDelete(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, info.CredentialID)
 	require.NotEmpty(t, info.publicKeyRaw)
+	// Registration requires presence (one dialog naming the new label).
+	require.Equal(t, int32(1), atomic.LoadInt32(calls))
 
 	// FindCredentials does not require presence.
 	creds, err := h.FindCredentials("example.com", "alice")
@@ -97,7 +99,7 @@ func TestHelperRegisterFindDelete(t *testing.T) {
 	assert.Equal(t, info.CredentialID, creds[0].CredentialID)
 	assert.Equal(t, "alice", creds[0].User.Name)
 	assert.Equal(t, []byte("handle"), creds[0].User.UserHandle)
-	assert.Equal(t, int32(0), atomic.LoadInt32(calls))
+	assert.Equal(t, int32(1), atomic.LoadInt32(calls))
 
 	require.NoError(t, h.DeleteNonInteractive(info.CredentialID))
 	creds, err = h.FindCredentials("example.com", "alice")
@@ -121,6 +123,7 @@ func TestPasswordlessDiscovery(t *testing.T) {
 	// A credential for another rpID must never be returned.
 	_, err = h.Register("other.example.com", "carol", []byte("carol-handle"))
 	require.NoError(t, err)
+	afterRegister := atomic.LoadInt32(calls)
 
 	// Username-less discovery (the passwordless call) returns every credential
 	// for the rpID, with the user handle that resolves the Teleport user.
@@ -135,7 +138,7 @@ func TestPasswordlessDiscovery(t *testing.T) {
 		"alice": "alice-handle",
 		"bob":   "bob-handle",
 	}, got)
-	assert.Equal(t, int32(0), atomic.LoadInt32(calls), "discovery must not require presence")
+	assert.Equal(t, afterRegister, atomic.LoadInt32(calls), "discovery must not require presence")
 
 	// An explicit user narrows to that user's credential.
 	creds, err = h.FindCredentials("teleport.example.com", "bob")
@@ -162,12 +165,22 @@ func TestHelperAuthenticateSignsAndReusesPresence(t *testing.T) {
 	pub := &ecdsa.PublicKey{Curve: elliptic.P256(), X: x, Y: y}
 	assert.True(t, ecdsa.VerifyASN1(pub, digest[:], sig), "signature must verify")
 
-	// The daemon prompted exactly once...
-	require.Equal(t, int32(1), atomic.LoadInt32(calls))
-	// ...and the 10s reuse window suppresses the second prompt.
+	// One prompt for the registration, one for the first signature with the
+	// credential...
+	require.Equal(t, int32(2), atomic.LoadInt32(calls))
+	// ...and the 10s reuse window suppresses the second prompt for the same
+	// credential.
 	_, err = h.Authenticate(nil, info.CredentialID, digest[:])
 	require.NoError(t, err)
-	assert.Equal(t, int32(1), atomic.LoadInt32(calls))
+	assert.Equal(t, int32(2), atomic.LoadInt32(calls))
+
+	// An approval for one credential never covers another (round-4 red-team F2).
+	other, err := h.Register("example.com", "bob", []byte("bob"))
+	require.NoError(t, err)
+	before := atomic.LoadInt32(calls)
+	_, err = h.Authenticate(nil, other.CredentialID, digest[:])
+	require.NoError(t, err)
+	assert.Equal(t, before+1, atomic.LoadInt32(calls), "a different credential must prompt again")
 }
 
 // TestPresenceReasonFromStore pins that the dialog's "for <user>@<rp id>" comes
@@ -207,6 +220,12 @@ func TestPresenceReasonFromStore(t *testing.T) {
 		"deleting teleport-admin@teleport.pcad.it",
 		"listing Touch ID credentials",
 	}, reasons)
+
+	// Registration goes through a dialog naming the label it creates.
+	reasons = nil
+	_, err = svc.register(PresencePeer{UID: 1001, PIDFD: -1}, "teleport.pcad.it", "pier", []byte("p"))
+	require.NoError(t, err)
+	assert.Equal(t, []string{"registering pier@teleport.pcad.it"}, reasons)
 }
 
 func TestHelperAuthContext(t *testing.T) {
@@ -221,13 +240,14 @@ func TestHelperAuthContext(t *testing.T) {
 	var ran bool
 	require.NoError(t, actx.Guard(func() { ran = true }))
 	assert.True(t, ran)
-	require.Equal(t, int32(1), atomic.LoadInt32(calls))
+	require.Equal(t, int32(2), atomic.LoadInt32(calls)) // register + guard
 
-	// Authenticate through the context reuses the Guard verification.
+	// A Guard approval ("choosing a Teleport user") does not cover signing
+	// with a specific credential: that dialog names the credential.
 	digest := sha256.Sum256([]byte("hello"))
 	_, err = h.Authenticate(actx, info.CredentialID, digest[:])
 	require.NoError(t, err)
-	assert.Equal(t, int32(1), atomic.LoadInt32(calls))
+	assert.Equal(t, int32(3), atomic.LoadInt32(calls))
 	actx.Close()
 }
 
