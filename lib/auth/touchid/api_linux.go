@@ -442,8 +442,9 @@ func diag(uid uint32) (*DiagResult, error) {
 }
 
 // registerCredential creates a new software P-256 credential. It does not
-// require user presence; the WebAuthn registration flow performs the
-// attestation signature, which does.
+// check user presence itself: its caller, signService.register, prompts
+// before calling it and grants exactly one signature by the new credential
+// (the attestation), so the registration is one dialog.
 func registerCredential(rpID, user string, userHandle []byte) (*CredentialInfo, error) {
 	if rpID == "" {
 		return nil, trace.BadParameter("rpID required")
@@ -589,6 +590,11 @@ type signService struct {
 	// an approval covers only the operation it was shown for (one credential,
 	// listing, ...), so a dialog for credential A never silently authorizes B.
 	verifiedAt map[presenceKey]time.Time
+	// attestGrant holds, per uid and new credential, a one-shot grant opened
+	// by an approved registration: it covers exactly one signature (the
+	// attestation tsh signs right after registering) within the reuse window,
+	// and is consumed by it (round-5b red-team F2).
+	attestGrant map[presenceKey]time.Time
 
 	mu            sync.Mutex
 	nextContextID int
@@ -597,8 +603,9 @@ type signService struct {
 
 func newSignService() *signService {
 	return &signService{
-		verifiedAt: make(map[presenceKey]time.Time),
-		contexts:   make(map[int]uint32),
+		verifiedAt:  make(map[presenceKey]time.Time),
+		attestGrant: make(map[presenceKey]time.Time),
+		contexts:    make(map[int]uint32),
 	}
 }
 
@@ -625,6 +632,13 @@ func (s *signService) ensureVerified(peer PresencePeer) error {
 		logger.DebugContext(context.Background(), "Reusing presence verification", "uid", peer.UID, "scope", peer.Scope)
 		return nil
 	}
+	if t, ok := s.attestGrant[key]; ok {
+		delete(s.attestGrant, key)
+		if time.Since(t) < fingerprintReuseWindow {
+			logger.DebugContext(context.Background(), "Consuming registration grant", "uid", peer.UID, "scope", peer.Scope)
+			return nil
+		}
+	}
 	if err := verifyPresence(context.Background(), peer); err != nil {
 		return trace.Wrap(err)
 	}
@@ -633,15 +647,19 @@ func (s *signService) ensureVerified(peer PresencePeer) error {
 }
 
 // register creates a credential after a presence check, so a label can only
-// appear in a later dialog after the user approved its registration. The
-// approval ("registering <user>@<rp id>") also covers the new credential's
-// first signature within the reuse window — tsh signs the attestation right
-// after registering — so registration is one dialog. It opens no window for
-// any existing credential.
+// appear in a later dialog after the user approved its registration. Every
+// registration prompts — there is no reuse window for registrations
+// (round-5b functional F-1, red-team F1/F1b). The approval ("registering
+// <user>@<rp id>") also covers exactly one signature by the new credential
+// within the reuse window — tsh signs the attestation right after
+// registering — so registration is one dialog. It opens nothing for any
+// existing credential.
 func (s *signService) register(peer PresencePeer, rpID, user string, userHandle []byte) (*CredentialInfo, error) {
 	peer.Reason = "registering " + user + "@" + rpID
-	peer.Scope = "register:" + user + "@" + rpID
-	if err := s.ensureVerified(peer); err != nil {
+	s.verifyMu.Lock()
+	err := verifyPresence(context.Background(), peer)
+	s.verifyMu.Unlock()
+	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 	info, err := registerCredential(rpID, user, userHandle)
@@ -649,7 +667,7 @@ func (s *signService) register(peer PresencePeer, rpID, user string, userHandle 
 		return nil, trace.Wrap(err)
 	}
 	s.verifyMu.Lock()
-	s.verifiedAt[presenceKey{uid: peer.UID, scope: "credential:" + info.CredentialID}] = time.Now()
+	s.attestGrant[presenceKey{uid: peer.UID, scope: "credential:" + info.CredentialID}] = time.Now()
 	s.verifyMu.Unlock()
 	return info, nil
 }

@@ -169,19 +169,35 @@ func TestHelperAuthenticateSignsAndReusesPresence(t *testing.T) {
 	// One dialog in all: the registration approval covers the new
 	// credential's first signature (the attestation tsh signs next)...
 	require.Equal(t, int32(1), atomic.LoadInt32(calls))
-	// ...and the 10s reuse window covers further signatures with it.
+	// ...and only that one: the grant is consumed, so the next signature
+	// prompts (round-5b red-team F2)...
 	_, err = h.Authenticate(nil, info.CredentialID, digest[:])
 	require.NoError(t, err)
-	assert.Equal(t, int32(1), atomic.LoadInt32(calls))
-
-	// An approval for one credential never covers another (round-4 red-team F2).
-	// The registration of bob opens a window for bob's credential only.
-	other, err := h.Register("example.com", "bob", []byte("bob"))
-	require.NoError(t, err)
-	require.Equal(t, int32(2), atomic.LoadInt32(calls))
-	_, err = h.Authenticate(nil, other.CredentialID, digest[:])
+	assert.Equal(t, int32(2), atomic.LoadInt32(calls))
+	// ...after which the normal per-credential reuse window applies.
+	_, err = h.Authenticate(nil, info.CredentialID, digest[:])
 	require.NoError(t, err)
 	assert.Equal(t, int32(2), atomic.LoadInt32(calls))
+
+	// An approval for one credential never covers another (round-4 red-team F2).
+	// The registration of bob opens a grant for bob's credential only.
+	other, err := h.Register("example.com", "bob", []byte("bob"))
+	require.NoError(t, err)
+	require.Equal(t, int32(3), atomic.LoadInt32(calls))
+	_, err = h.Authenticate(nil, other.CredentialID, digest[:])
+	require.NoError(t, err)
+	assert.Equal(t, int32(3), atomic.LoadInt32(calls))
+
+	// Every registration prompts, even for the same label within the window
+	// and for colliding labels (round-5b functional F-1, red-team F1/F1b).
+	_, err = h.Register("example.com", "bob", []byte("bob"))
+	require.NoError(t, err)
+	require.Equal(t, int32(4), atomic.LoadInt32(calls))
+	_, err = h.Register("c", "a@b", []byte("x"))
+	require.NoError(t, err)
+	_, err = h.Register("b@c", "a", []byte("y"))
+	require.NoError(t, err)
+	assert.Equal(t, int32(6), atomic.LoadInt32(calls))
 
 }
 
