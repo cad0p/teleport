@@ -1952,6 +1952,11 @@ func (h *Handler) pingWithConnector(w http.ResponseWriter, r *http.Request, p ht
 	}
 
 	hasMessageOfTheDay := cap.GetMessageOfTheDay() != ""
+	// Every branch below reports the cluster default session TTL, as
+	// getAuthSettings does for /webapi/ping: tsh requests it when --ttl is
+	// omitted, and a client whose profile names a connector (e.g. a
+	// passwordless login) only ever pings this endpoint.
+	defaultSessionTTL := cap.GetDefaultSessionTTL()
 	if slices.Contains(constants.SystemConnectors, connectorName) {
 		response.Auth, err = localSettings(r.Context(), cap, h.logger)
 		if err != nil {
@@ -1959,6 +1964,7 @@ func (h *Handler) pingWithConnector(w http.ResponseWriter, r *http.Request, p ht
 		}
 		response.Auth.HasMessageOfTheDay = hasMessageOfTheDay
 		response.Auth.LoadAllCAs = loadAllCAs
+		response.Auth.DefaultSessionTTL = defaultSessionTTL
 		response.Auth.Local.Name = connectorName // echo connector queried by caller
 		return response, nil
 	}
@@ -1976,6 +1982,7 @@ func (h *Handler) pingWithConnector(w http.ResponseWriter, r *http.Request, p ht
 				response.Auth = oidcSettings(oidcConnectors[index], cap)
 				response.Auth.HasMessageOfTheDay = hasMessageOfTheDay
 				response.Auth.LoadAllCAs = loadAllCAs
+				response.Auth.DefaultSessionTTL = defaultSessionTTL
 				return response, nil
 			}
 		}
@@ -1990,6 +1997,7 @@ func (h *Handler) pingWithConnector(w http.ResponseWriter, r *http.Request, p ht
 				response.Auth = samlSettings(samlConnectors[index], cap)
 				response.Auth.HasMessageOfTheDay = hasMessageOfTheDay
 				response.Auth.LoadAllCAs = loadAllCAs
+				response.Auth.DefaultSessionTTL = defaultSessionTTL
 				return response, nil
 			}
 		}
@@ -2004,6 +2012,7 @@ func (h *Handler) pingWithConnector(w http.ResponseWriter, r *http.Request, p ht
 				response.Auth = githubSettings(githubConnectors[index], cap)
 				response.Auth.HasMessageOfTheDay = hasMessageOfTheDay
 				response.Auth.LoadAllCAs = loadAllCAs
+				response.Auth.DefaultSessionTTL = defaultSessionTTL
 				return response, nil
 			}
 		}

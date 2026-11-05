@@ -23,7 +23,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/gravitational/roundtrip"
@@ -233,6 +235,48 @@ func TestPing(t *testing.T) {
 			require.NoError(t, json.Unmarshal(resp.Bytes(), &pingResp))
 
 			test.assertResp(cap, &pingResp)
+		})
+	}
+}
+
+// TestPing_defaultSessionTTL makes sure every ping endpoint reports the
+// cluster default session TTL. tsh requests that TTL when --ttl is omitted,
+// and a client whose profile names a connector (e.g. after a passwordless
+// login) only pings /webapi/ping/<connector>; without the field it falls back
+// to the 12h client default regardless of the cluster setting.
+func TestPing_defaultSessionTTL(t *testing.T) {
+	ctx := context.Background()
+	env := newWebPack(t, 1)
+	authServer := env.server.Auth()
+
+	clt, err := client.NewWebClient(env.proxies[0].webURL.String(), roundtrip.HTTPClient(client.NewInsecureWebClient()))
+	require.NoError(t, err)
+
+	const want = 168 * time.Hour
+	cap, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
+		Type:         constants.Local,
+		SecondFactor: constants.SecondFactorOptional,
+		Webauthn: &types.Webauthn{
+			RPID: "example.com",
+		},
+		DefaultSessionTTL: types.Duration(want),
+	})
+	require.NoError(t, err)
+	_, err = authServer.UpsertAuthPreference(ctx, cap)
+	require.NoError(t, err)
+
+	for _, path := range [][]string{
+		{"webapi", "ping"},
+		{"webapi", "ping", constants.LocalConnector},
+		{"webapi", "ping", constants.PasswordlessConnector},
+		{"webapi", "ping", constants.HeadlessConnector},
+	} {
+		t.Run(strings.Join(path, "/"), func(t *testing.T) {
+			resp, err := clt.Get(ctx, clt.Endpoint(path...), url.Values{})
+			require.NoError(t, err)
+			var pingResp webclient.PingResponse
+			require.NoError(t, json.Unmarshal(resp.Bytes(), &pingResp))
+			assert.Equal(t, want, pingResp.Auth.DefaultSessionTTL.Duration())
 		})
 	}
 }
