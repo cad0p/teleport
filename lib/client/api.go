@@ -3618,7 +3618,9 @@ func (tc *TeleportClient) Login(ctx context.Context) (*KeyRing, error) {
 		return nil, trace.Wrap(err)
 	}
 
-	tc.KeyTTL = cmp.Or(tc.KeyTTL, pr.Auth.DefaultSessionTTL.Duration(), apidefaults.CertDuration)
+	if tc.KeyTTL == 0 {
+		tc.KeyTTL = cmp.Or(tc.clusterDefaultSessionTTL(ctx, pr), apidefaults.CertDuration)
+	}
 
 	// Get the SSHLoginFunc that matches client and cluster settings.
 	sshLoginFunc, err := tc.getSSHLoginFunc(pr)
@@ -3640,6 +3642,34 @@ func (tc *TeleportClient) Login(ctx context.Context) (*KeyRing, error) {
 	}
 
 	return keyRing, nil
+}
+
+// clusterDefaultSessionTTL returns the cluster's default session TTL (the
+// auth preference default_session_ttl), or 0 when it cannot be read.
+//
+// Proxies that predate the fix omit auth.default_session_ttl from
+// /webapi/ping/<connector>, and a client pings that endpoint whenever an auth
+// connector is set, including the one a profile stores after a passwordless
+// login. Without the field every such login would silently fall back to the
+// 12h client default, so the TTL is read from the connector-less
+// /webapi/ping instead, which has always carried it. The fallback can go once
+// supported proxy versions all carry the pingWithConnector fix.
+func (tc *TeleportClient) clusterDefaultSessionTTL(ctx context.Context, pr *webclient.PingResponse) time.Duration {
+	if ttl := pr.Auth.DefaultSessionTTL.Duration(); ttl != 0 || tc.AuthConnector == "" {
+		return ttl
+	}
+	plain, err := webclient.Ping(&webclient.Config{
+		Context:      ctx,
+		ProxyAddr:    tc.WebProxyAddr,
+		Insecure:     tc.InsecureSkipVerify,
+		Pool:         loopbackPool(tc.WebProxyAddr),
+		ExtraHeaders: tc.ExtraProxyHeaders,
+	})
+	if err != nil {
+		log.DebugContext(ctx, "Could not read the cluster default session TTL from the connector-less ping", "error", err)
+		return 0
+	}
+	return plain.Auth.DefaultSessionTTL.Duration()
 }
 
 // LoginWeb logs the user in via the Teleport web api the same way that the web UI does.
