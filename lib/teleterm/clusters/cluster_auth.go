@@ -137,7 +137,12 @@ func (c *Cluster) updateClientFromPingResponse(ctx context.Context) (*webclient.
 		return nil, trace.Wrap(err)
 	}
 
-	c.clusterClient.KeyTTL = cmp.Or(c.clusterClient.KeyTTL, pingResp.Auth.DefaultSessionTTL.Duration(), defaults.CertDuration)
+	if c.clusterClient.KeyTTL == 0 {
+		// The connector ping (SSO and passwordless logins set AuthConnector)
+		// omits the default on older proxies; ClusterDefaultSessionTTL reads
+		// it from the connector-less ping instead.
+		c.clusterClient.KeyTTL = cmp.Or(c.clusterClient.ClusterDefaultSessionTTL(ctx, pingResp), defaults.CertDuration)
+	}
 
 	return pingResp, nil
 }

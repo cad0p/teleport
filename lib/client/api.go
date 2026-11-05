@@ -3618,9 +3618,7 @@ func (tc *TeleportClient) Login(ctx context.Context) (*KeyRing, error) {
 		return nil, trace.Wrap(err)
 	}
 
-	if tc.KeyTTL == 0 {
-		tc.KeyTTL = cmp.Or(tc.clusterDefaultSessionTTL(ctx, pr), apidefaults.CertDuration)
-	}
+	tc.KeyTTL = tc.resolveKeyTTL(ctx, pr)
 
 	// Get the SSHLoginFunc that matches client and cluster settings.
 	sshLoginFunc, err := tc.getSSHLoginFunc(pr)
@@ -3644,8 +3642,23 @@ func (tc *TeleportClient) Login(ctx context.Context) (*KeyRing, error) {
 	return keyRing, nil
 }
 
-// clusterDefaultSessionTTL returns the cluster's default session TTL (the
-// auth preference default_session_ttl), or 0 when it cannot be read.
+// resolveKeyTTL returns the TTL a login requests: an explicit --ttl as is,
+// else the cluster default, else the 12h client default.
+func (tc *TeleportClient) resolveKeyTTL(ctx context.Context, pr *webclient.PingResponse) time.Duration {
+	if tc.KeyTTL != 0 {
+		return tc.KeyTTL
+	}
+	return cmp.Or(tc.ClusterDefaultSessionTTL(ctx, pr), apidefaults.CertDuration)
+}
+
+// defaultSessionTTLPingTimeout bounds the extra connector-less ping in
+// ClusterDefaultSessionTTL, so a slow proxy cannot stall a login for the
+// webclient's 30s default before it falls back to the client default.
+const defaultSessionTTLPingTimeout = 5 * time.Second
+
+// ClusterDefaultSessionTTL returns the cluster's default session TTL (the
+// auth preference default_session_ttl), or 0 when it cannot be read or is not
+// positive.
 //
 // Proxies that predate the fix omit auth.default_session_ttl from
 // /webapi/ping/<connector>, and a client pings that endpoint whenever an auth
@@ -3654,9 +3667,9 @@ func (tc *TeleportClient) Login(ctx context.Context) (*KeyRing, error) {
 // 12h client default, so the TTL is read from the connector-less
 // /webapi/ping instead, which has always carried it. The fallback can go once
 // supported proxy versions all carry the pingWithConnector fix.
-func (tc *TeleportClient) clusterDefaultSessionTTL(ctx context.Context, pr *webclient.PingResponse) time.Duration {
-	if ttl := pr.Auth.DefaultSessionTTL.Duration(); ttl != 0 || tc.AuthConnector == "" {
-		return ttl
+func (tc *TeleportClient) ClusterDefaultSessionTTL(ctx context.Context, pr *webclient.PingResponse) time.Duration {
+	if ttl := pr.Auth.DefaultSessionTTL.Duration(); ttl > 0 || tc.AuthConnector == "" {
+		return max(ttl, 0)
 	}
 	plain, err := webclient.Ping(&webclient.Config{
 		Context:      ctx,
@@ -3664,12 +3677,14 @@ func (tc *TeleportClient) clusterDefaultSessionTTL(ctx context.Context, pr *webc
 		Insecure:     tc.InsecureSkipVerify,
 		Pool:         loopbackPool(tc.WebProxyAddr),
 		ExtraHeaders: tc.ExtraProxyHeaders,
+		Timeout:      defaultSessionTTLPingTimeout,
 	})
 	if err != nil {
-		log.DebugContext(ctx, "Could not read the cluster default session TTL from the connector-less ping", "error", err)
+		log.WarnContext(ctx, "Could not read the cluster default session TTL, the login falls back to the client default (12h); pass --ttl for a longer session",
+			"proxy_addr", tc.WebProxyAddr, "error", err)
 		return 0
 	}
-	return plain.Auth.DefaultSessionTTL.Duration()
+	return max(plain.Auth.DefaultSessionTTL.Duration(), 0)
 }
 
 // LoginWeb logs the user in via the Teleport web api the same way that the web UI does.

@@ -265,11 +265,25 @@ func TestPing_defaultSessionTTL(t *testing.T) {
 	_, err = authServer.UpsertAuthPreference(ctx, cap)
 	require.NoError(t, err)
 
+	// A GitHub connector exercises the non-system branch (OIDC and SAML are
+	// not available in the OSS build and share its shape).
+	github, err := types.NewGithubConnector("test-github", types.GithubConnectorSpecV3{
+		TeamsToLogins: []types.TeamMapping{{
+			Organization: "octocats",
+			Team:         "dummy",
+			Logins:       []string{"dummy"},
+		}},
+	})
+	require.NoError(t, err)
+	_, err = authServer.UpsertGithubConnector(ctx, github)
+	require.NoError(t, err)
+
 	for _, path := range [][]string{
 		{"webapi", "ping"},
 		{"webapi", "ping", constants.LocalConnector},
 		{"webapi", "ping", constants.PasswordlessConnector},
 		{"webapi", "ping", constants.HeadlessConnector},
+		{"webapi", "ping", "test-github"},
 	} {
 		t.Run(strings.Join(path, "/"), func(t *testing.T) {
 			resp, err := clt.Get(ctx, clt.Endpoint(path...), url.Values{})

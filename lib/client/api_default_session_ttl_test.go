@@ -28,10 +28,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport/api/client/webclient"
 	"github.com/gravitational/teleport/api/constants"
+	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
 )
 
@@ -61,7 +63,7 @@ func TestClusterDefaultSessionTTL(t *testing.T) {
 				pr.Auth.DefaultSessionTTL = types.Duration(clusterTTL)
 			}
 			w.Header().Set("Content-Type", "application/json")
-			require.NoError(t, json.NewEncoder(w).Encode(pr))
+			assert.NoError(t, json.NewEncoder(w).Encode(pr))
 		}))
 		t.Cleanup(srv.Close)
 		return strings.TrimPrefix(srv.URL, "https://"), func() []string {
@@ -82,14 +84,14 @@ func TestClusterDefaultSessionTTL(t *testing.T) {
 	t.Run("ping already carries the default", func(t *testing.T) {
 		addr, paths := newProxy(t, http.StatusOK)
 		pr := &webclient.PingResponse{Auth: webclient.AuthenticationSettings{DefaultSessionTTL: types.Duration(time.Hour)}}
-		got := newClient(addr, constants.PasswordlessConnector).clusterDefaultSessionTTL(context.Background(), pr)
+		got := newClient(addr, constants.PasswordlessConnector).ClusterDefaultSessionTTL(context.Background(), pr)
 		require.Equal(t, time.Hour, got)
 		require.Empty(t, paths(), "no extra ping when the response already has the default")
 	})
 
 	t.Run("no connector means the plain ping was used", func(t *testing.T) {
 		addr, paths := newProxy(t, http.StatusOK)
-		got := newClient(addr, "").clusterDefaultSessionTTL(context.Background(), &webclient.PingResponse{})
+		got := newClient(addr, "").ClusterDefaultSessionTTL(context.Background(), &webclient.PingResponse{})
 		require.Zero(t, got)
 		require.Empty(t, paths(), "no extra ping when the plain ping already answered")
 	})
@@ -97,15 +99,39 @@ func TestClusterDefaultSessionTTL(t *testing.T) {
 	for _, connector := range []string{constants.PasswordlessConnector, constants.LocalConnector} {
 		t.Run("connector "+connector+" falls back to the plain ping", func(t *testing.T) {
 			addr, paths := newProxy(t, http.StatusOK)
-			got := newClient(addr, connector).clusterDefaultSessionTTL(context.Background(), &webclient.PingResponse{})
+			got := newClient(addr, connector).ClusterDefaultSessionTTL(context.Background(), &webclient.PingResponse{})
 			require.Equal(t, clusterTTL, got)
 			require.Equal(t, []string{"/webapi/ping"}, paths())
 		})
 	}
 
+	t.Run("resolveKeyTTL keeps an explicit --ttl and makes no request", func(t *testing.T) {
+		addr, paths := newProxy(t, http.StatusOK)
+		tc := newClient(addr, constants.PasswordlessConnector)
+		tc.KeyTTL = 30 * time.Minute
+		require.Equal(t, 30*time.Minute, tc.resolveKeyTTL(context.Background(), &webclient.PingResponse{}))
+		require.Empty(t, paths())
+	})
+
+	t.Run("resolveKeyTTL uses the cluster default, else 12h", func(t *testing.T) {
+		addr, _ := newProxy(t, http.StatusOK)
+		require.Equal(t, clusterTTL, newClient(addr, constants.PasswordlessConnector).resolveKeyTTL(context.Background(), &webclient.PingResponse{}))
+		failing, _ := newProxy(t, http.StatusInternalServerError)
+		require.Equal(t, apidefaults.CertDuration, newClient(failing, constants.PasswordlessConnector).resolveKeyTTL(context.Background(), &webclient.PingResponse{}))
+	})
+
+	t.Run("a negative default is treated as absent", func(t *testing.T) {
+		addr, paths := newProxy(t, http.StatusOK)
+		pr := &webclient.PingResponse{Auth: webclient.AuthenticationSettings{DefaultSessionTTL: types.Duration(-time.Hour)}}
+		require.Zero(t, newClient(addr, "").ClusterDefaultSessionTTL(context.Background(), pr))
+		got := newClient(addr, constants.PasswordlessConnector).ClusterDefaultSessionTTL(context.Background(), pr)
+		require.Equal(t, clusterTTL, got, "a connector client falls back to the plain ping")
+		require.Equal(t, []string{"/webapi/ping"}, paths())
+	})
+
 	t.Run("a failed plain ping yields zero, not an error", func(t *testing.T) {
 		addr, paths := newProxy(t, http.StatusInternalServerError)
-		got := newClient(addr, constants.PasswordlessConnector).clusterDefaultSessionTTL(context.Background(), &webclient.PingResponse{})
+		got := newClient(addr, constants.PasswordlessConnector).ClusterDefaultSessionTTL(context.Background(), &webclient.PingResponse{})
 		require.Zero(t, got)
 		require.NotEmpty(t, paths())
 	})
